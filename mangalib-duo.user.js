@@ -113,8 +113,8 @@
   let nativeSyncTimer = null;
   let nativeStepTimer = null;
   let nativeNextKey = null;
-  let nativeUseClick = false;
   let nativeNextSide = 'right';
+  let nativeSyncMethod = 0; // 0 = ArrowLeft/Right, 1 = KeyA/KeyD, 2 = click
 
   // Состояние вкладок комментариев (левая / правая страница разворота)
   const commentTabsState = {
@@ -467,12 +467,29 @@
   }
 
   // =========================================================================
-  // 2. СТИЛИ (ЧИСТАЯ КНИГА БЕЗ ТЕНЕЙ, ПОЛОСА ВБОК, КОММЕНТЫ + ВКЛАДКИ, МЕНЮ)
+  // 2. СТИЛИ (ШАПКА НАВЕРХУ, ЧИСТАЯ КНИГА, ПОЛОСА ВБОК, ВКЛАДКИ КОММЕНТОВ)
   // =========================================================================
 
   const STYLES = `
-    [data-ml-duo-chrome="top"],
-    [data-ml-duo-chrome="bottom"] {
+    html.ml-duo-active,
+    html.ml-duo-active body {
+      overflow-x: clip !important;
+    }
+
+    html.ml-duo-active [data-ml-duo-chrome="top"] {
+      position: fixed !important;
+      top: 0 !important;
+      left: 0 !important;
+      right: 0 !important;
+      z-index: 60 !important;
+      transition: opacity 0.18s ease, transform 0.18s ease !important;
+    }
+
+    html.ml-duo-active [data-ml-duo-chrome="bottom"] {
+      position: fixed !important;
+      bottom: 0 !important;
+      left: 0 !important;
+      right: 0 !important;
       z-index: 60 !important;
       transition: opacity 0.18s ease, transform 0.18s ease !important;
     }
@@ -489,23 +506,26 @@
       transform: translateY(100%) !important;
     }
 
-    /* Схлопываем родные картинки в 0px, чтобы не мешали, но родная читалка оставалась активной */
+    /* Прячем родную картинку под сценой с реальным размером 100vw x 100vh:
+       место в потоке не занимает, но клики и переключение страниц в MangaLib работают штатно */
     .ml-duo-native-masked {
-      height: 0 !important;
-      min-height: 0 !important;
-      max-height: 0 !important;
-      overflow: hidden !important;
+      position: fixed !important;
+      top: 0 !important;
+      left: 0 !important;
+      width: 100vw !important;
+      height: 100vh !important;
       opacity: 0 !important;
-      padding: 0 !important;
-      margin: 0 !important;
-      border: 0 !important;
       pointer-events: none !important;
+      overflow: hidden !important;
+      z-index: -10 !important;
     }
 
-    /* Сцена стоит первым экраном в обычном потоке; скролл вниз сразу ведёт к комментам */
+    /* Сцена во всю ширину экрана прямо над комментариями */
     #ml-duo-stage {
       position: relative;
-      width: 100%;
+      width: 100vw;
+      left: 50%;
+      margin-left: -50vw;
       height: 100vh;
       z-index: 5;
       background: var(--ml-duo-bg, #141414);
@@ -948,15 +968,16 @@
       }
       if (el.dataset.mlDuoChrome) continue;
 
+      const isHeaderTag = el.tagName === 'HEADER';
       const style = getComputedStyle(el);
-      if (style.position !== 'fixed' && style.position !== 'sticky') continue;
+      if (!isHeaderTag && style.position !== 'fixed' && style.position !== 'sticky') continue;
 
       const rect = el.getBoundingClientRect();
       if (rect.width < vw * 0.45 || rect.height < 28 || rect.height > 140) continue;
 
-      if (rect.top <= 12) {
+      if (isHeaderTag || rect.top <= 24) {
         el.dataset.mlDuoChrome = 'top';
-      } else if (rect.bottom >= vh - 12) {
+      } else if (rect.bottom >= vh - 24) {
         el.dataset.mlDuoChrome = 'bottom';
       }
     }
@@ -1232,13 +1253,25 @@
 
   // --- Синхронизация скрытой родной читалки MangaLib с нужной страницей ---
   function isNativeHorizontalReader() {
-    return chapterPages.length > 1 && getNativeReaderImages().length === 1;
+    if (chapterPages.length <= 1) return false;
+    const imgs = getNativeReaderImages();
+    if (chapterPages.length >= 5 && imgs.length >= Math.min(chapterPages.length, 5)) {
+      return false;
+    }
+    return imgs.length >= 1;
   }
 
   function getNativeCurrentPage() {
     const imgs = getNativeReaderImages();
-    if (imgs.length === 1 && chapterPages.length > 0) {
-      const src = imgs[0].currentSrc || imgs[0].src || '';
+    if (imgs.length >= 1 && chapterPages.length > 0) {
+      const activeImg = imgs.find(img => getComputedStyle(img).display !== 'none') || imgs[0];
+      const dataP = activeImg.closest('[data-p], [data-page]');
+      if (dataP) {
+        const n = Number(dataP.getAttribute('data-p') || dataP.getAttribute('data-page'));
+        if (n >= 1 && n <= chapterPages.length) return n;
+      }
+
+      const src = activeImg.currentSrc || activeImg.src || '';
       if (src) {
         for (let i = 0; i < chapterPages.length; i++) {
           const p = chapterPages[i];
@@ -1255,8 +1288,9 @@
       const total = String(chapterPages.length);
       const nodes = document.querySelectorAll('header *, footer *, nav *, [data-ml-duo-chrome] *');
       for (const el of nodes) {
-        if (el.children.length > 0) continue;
-        const m = (el.textContent || '').trim().match(/^(?:Страница\s+)?(\d+)\s*(?:\/|из)\s*(\d+)$/i);
+        if (el.children.length > 4) continue;
+        const txt = (el.textContent || '').replace(/\s+/g, ' ').trim();
+        const m = txt.match(/^(?:стр\.?|страница|page)?\s*(\d+)\s*(?:\/|из|of)\s*(\d+)$/i);
         if (m && m[2] === total) {
           const n = Number(m[1]);
           if (n >= 1 && n <= chapterPages.length) return n;
@@ -1316,47 +1350,52 @@
     return false;
   }
 
-  function dispatchNativeKey(keyName) {
-    const code = keyName === 'ArrowRight' ? 39 : 37;
+  function dispatchNativeKey(keyName, useLetter = false) {
+    if (document.activeElement && document.activeElement !== document.body && typeof document.activeElement.blur === 'function') {
+      document.activeElement.blur();
+    }
+    const isRight = keyName === 'ArrowRight';
+    const key = useLetter ? (isRight ? 'd' : 'a') : keyName;
+    const code = useLetter ? (isRight ? 'KeyD' : 'KeyA') : keyName;
+    const keyCode = useLetter ? (isRight ? 68 : 65) : (isRight ? 39 : 37);
+
     isNativeSyncEvent = true;
     try {
       const ev = new KeyboardEvent('keydown', {
-        key: keyName,
-        code: keyName,
-        keyCode: code,
-        which: code,
+        key,
+        code,
+        keyCode,
+        which: keyCode,
         bubbles: true,
         cancelable: true
       });
-      (document.body || document).dispatchEvent(ev);
+      document.dispatchEvent(ev);
     } finally {
       isNativeSyncEvent = false;
     }
   }
 
   function dispatchNativeClick(side) {
-    const target = getNativeReaderImages()[0];
+    const imgs = getNativeReaderImages();
+    const target = imgs.find(img => getComputedStyle(img).display !== 'none') || imgs[0] || hiddenNativeElements[0];
     if (!target) return;
-    const rect = target.getBoundingClientRect();
-    const w = rect.width || window.innerWidth;
-    const h = rect.height || window.innerHeight;
-    const clientX = Math.round((rect.left || 0) + w * (side === 'right' ? 0.85 : 0.15));
-    const clientY = Math.round((rect.top || 0) + Math.max(10, h * 0.5));
+    const vw = window.innerWidth || 1000;
+    const vh = window.innerHeight || 700;
+    const clientX = Math.round(vw * (side === 'right' ? 0.85 : 0.15));
+    const clientY = Math.round(vh * 0.5);
+
     isNativeSyncEvent = true;
     try {
-      target.dispatchEvent(new MouseEvent('click', {
-        bubbles: true,
-        cancelable: true,
-        clientX,
-        clientY,
-        view: window
-      }));
+      const opts = { bubbles: true, cancelable: true, clientX, clientY, view: window };
+      target.dispatchEvent(new MouseEvent('mousedown', opts));
+      target.dispatchEvent(new MouseEvent('mouseup', opts));
+      target.dispatchEvent(new MouseEvent('click', opts));
     } finally {
       isNativeSyncEvent = false;
     }
   }
 
-  function syncPageQueryParam(pageNum, routeOverride = null, notifySite = false) {
+  function syncPageQueryParam(pageNum, routeOverride = null, notifySite = false, immediate = false) {
     clearTimeout(nativeSyncTimer);
     clearTimeout(nativeStepTimer);
 
@@ -1385,14 +1424,14 @@
       if (tryJumpViaNativeInput(pageNum)) {
         nativeStepTimer = setTimeout(() => {
           if (getNativeCurrentPage() !== pageNum) runStepLoop();
-        }, 50);
+        }, 90);
         return;
       }
 
       runStepLoop();
 
       function runStepLoop() {
-        let stepsLeft = chapterPages.length + 2;
+        let stepsLeft = chapterPages.length + 4;
         let stuckCount = 0;
 
         const nextStep = () => {
@@ -1411,12 +1450,13 @@
           const prevSide = nextSide === 'right' ? 'left' : 'right';
           const sideToClick = wantNext ? nextSide : prevSide;
 
-          if (!nativeUseClick) dispatchNativeKey(keyToSend);
+          if (nativeSyncMethod === 0) dispatchNativeKey(keyToSend, false);
+          else if (nativeSyncMethod === 1) dispatchNativeKey(keyToSend, true);
           else dispatchNativeClick(sideToClick);
 
           nativeStepTimer = setTimeout(() => {
             if (location.pathname !== startPathname) {
-              if (!nativeUseClick) nativeNextKey = keyToSend === 'ArrowRight' ? 'ArrowLeft' : 'ArrowRight';
+              if (nativeSyncMethod < 2) nativeNextKey = keyToSend === 'ArrowRight' ? 'ArrowLeft' : 'ArrowRight';
               else nativeNextSide = sideToClick === 'right' ? 'left' : 'right';
               window.history.back();
               return;
@@ -1426,7 +1466,7 @@
             if (after !== cur) {
               stuckCount = 0;
               const wentForward = after > cur;
-              if (!nativeUseClick) {
+              if (nativeSyncMethod < 2) {
                 nativeNextKey = wentForward ? keyToSend : (keyToSend === 'ArrowRight' ? 'ArrowLeft' : 'ArrowRight');
               } else {
                 nativeNextSide = wentForward ? sideToClick : (sideToClick === 'right' ? 'left' : 'right');
@@ -1434,17 +1474,17 @@
               if (after !== pageNum) nextStep();
             } else {
               stuckCount++;
-              if (!nativeUseClick && stuckCount === 1) {
-                nativeUseClick = true;
+              if (stuckCount <= 2) {
+                nativeSyncMethod = (nativeSyncMethod + 1) % 3;
                 nextStep();
               }
             }
-          }, 40);
+          }, 90);
         };
 
         nextStep();
       }
-    }, 180);
+    }, immediate ? 0 : 160);
   }
 
   // --- Вкладки комментариев (левая / правая страница разворота) ---
@@ -1496,9 +1536,10 @@
         const targetPage = Number(btn.dataset.page);
         if (!targetPage || targetPage === commentTabsState.activePage) return;
 
+        btn.blur();
         commentTabsState.activePage = targetPage;
         renderCommentTabsUI();
-        syncPageQueryParam(targetPage, null, true);
+        syncPageQueryParam(targetPage, null, true, true);
       });
     }
 
@@ -1626,7 +1667,7 @@
 
     const firstPage = group.pages[0] + 1;
     updateCommentTabsForSlots(slots, firstPage);
-    syncPageQueryParam(firstPage, null, true);
+    syncPageQueryParam(firstPage, null, true, false);
 
     preloadSpread(groups, currentSpreadIndex + 1);
     preloadSpread(groups, currentSpreadIndex + 2);
@@ -1815,7 +1856,6 @@
     currentSpreadIndex = nextIdx;
     lastSpreadChangeAt = Date.now();
 
-    // Без анимации (выключена или одиночный широкий скан) — мгновенная смена
     if (!settings.pageCurl || oldGroup.solo || newGroup.solo) {
       renderStaticCurrentSpread();
       return;
@@ -1913,7 +1953,6 @@
 
     if (!curl.isDragging) {
       if (Math.hypot(dx, dy) < 8) return;
-      // Вертикальный свайп отдаём браузеру, чтобы листать вниз к комментариям
       if (Math.abs(dy) > Math.abs(dx) * 1.2) {
         cleanupPagedDragListeners();
         curl.active = false;
@@ -2114,7 +2153,7 @@
     if (initGroup) {
       const initSlots = mapGroupToSlots(initGroup, chapterPages);
       updateCommentTabsForSlots(initSlots, initGroup.pages[0] + 1);
-      syncPageQueryParam(initGroup.pages[0] + 1, null, true);
+      syncPageQueryParam(initGroup.pages[0] + 1, null, true, false);
     }
 
     const alignInitialScroll = () => {
@@ -2262,9 +2301,9 @@
         renderCommentTabsUI();
 
         if (ch?.route) {
-          syncPageQueryParam(pageNum, notify ? null : ch.route, notify);
+          syncPageQueryParam(pageNum, notify ? null : ch.route, notify, false);
         } else {
-          syncPageQueryParam(pageNum, null, notify);
+          syncPageQueryParam(pageNum, null, notify, false);
         }
       }
     }, 140);
@@ -2420,8 +2459,15 @@
       e.stopPropagation();
     });
 
-    // Вставляем сцену в начало body — сразу под ней остаются родные комментарии
-    document.body.insertBefore(stage, document.body.firstChild);
+    // Вставляем сцену перед скрытым контейнером картинок, чтобы шапка наверху и комменты внизу остались на местах
+    const mountAnchor = hiddenNativeElements[0];
+    if (mountAnchor && mountAnchor.parentElement) {
+      mountAnchor.insertAdjacentElement('beforebegin', stage);
+    } else {
+      const mainEl = document.querySelector('main');
+      if (mainEl) mainEl.insertBefore(stage, mainEl.firstChild);
+      else document.body.insertBefore(stage, document.body.firstChild);
+    }
     return stage;
   }
 
@@ -2482,7 +2528,7 @@
     if (stage) stage.remove();
 
     restoreNativeElements();
-    document.documentElement.classList.remove('ml-duo-ui-hidden');
+    document.documentElement.classList.remove('ml-duo-active', 'ml-duo-ui-hidden');
   }
 
   function getLayoutSig() {
@@ -2509,6 +2555,7 @@
       return;
     }
 
+    document.documentElement.classList.add('ml-duo-active');
     applyCleanScreenState(uiHidden);
     maskNativeImages(nativeImgs);
 
