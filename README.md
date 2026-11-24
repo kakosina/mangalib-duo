@@ -5,7 +5,7 @@ UserScript для чтения манги на **MangaLib** в двустран�
 
 ## Установка (нужен менеджер скриптов для вашего браузера)
    
-[![Установить скрипт](https://img.shields.io/badge/Установить_скрипт-v2.9.0-f59e0b?style=for-the-badge)](https://raw.githubusercontent.com/kakosina/mangalib-duo/main/mangalib-duo.user.js)
+[![Установить скрипт](https://img.shields.io/badge/Установить_скрипт-v2.9.1-f59e0b?style=for-the-badge)](https://raw.githubusercontent.com/kakosina/mangalib-duo/main/mangalib-duo.user.js)
 
 ## Возможности
 
