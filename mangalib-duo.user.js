@@ -108,6 +108,21 @@
   let hiddenNativeElements = [];
   let uiHidden = settings.cleanScreen;
 
+  // Синхронизация со скрытой родной читалкой MangaLib (для комментариев к страницам)
+  let isNativeSyncEvent = false;
+  let nativeSyncTimer = null;
+  let nativeStepTimer = null;
+  let nativeNextKey = null;
+  let nativeUseClick = false;
+  let nativeNextSide = 'right';
+
+  // Состояние вкладок комментариев (левая / правая страница разворота)
+  const commentTabsState = {
+    leftPage: null,
+    rightPage: null,
+    activePage: null
+  };
+
   // Размеры раскрытой книги (1 страница = pageW x pageH)
   let bookMetrics = { pageW: 500, pageH: 720, left: 0, top: 0 };
 
@@ -452,7 +467,7 @@
   }
 
   // =========================================================================
-  // 2. СТИЛИ (ЧИСТАЯ КНИГА БЕЗ ТЕНЕЙ, ПОЛОСА ВБОК, КОММЕНТЫ СНИЗУ, МЕНЮ)
+  // 2. СТИЛИ (ЧИСТАЯ КНИГА БЕЗ ТЕНЕЙ, ПОЛОСА ВБОК, КОММЕНТЫ + ВКЛАДКИ, МЕНЮ)
   // =========================================================================
 
   const STYLES = `
@@ -474,9 +489,17 @@
       transform: translateY(100%) !important;
     }
 
-    /* Сворачиваем только родные картинки, чтобы родные комменты были сразу под разворотом */
+    /* Схлопываем родные картинки в 0px, чтобы не мешали, но родная читалка оставалась активной */
     .ml-duo-native-masked {
-      display: none !important;
+      height: 0 !important;
+      min-height: 0 !important;
+      max-height: 0 !important;
+      overflow: hidden !important;
+      opacity: 0 !important;
+      padding: 0 !important;
+      margin: 0 !important;
+      border: 0 !important;
+      pointer-events: none !important;
     }
 
     /* Сцена стоит первым экраном в обычном потоке; скролл вниз сразу ведёт к комментам */
@@ -679,6 +702,49 @@
       will-change: clip-path;
     }
 
+    /* --- Вкладки комментариев (левая / правая страница разворота) --- */
+    #ml-duo-comment-tabs {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 6px;
+      max-width: 560px;
+      margin: 14px auto 10px;
+      padding: 4px;
+      border-radius: 8px;
+      background: rgba(128, 128, 128, 0.14);
+      box-sizing: border-box;
+      font-family: inherit;
+    }
+
+    #ml-duo-comment-tabs.is-hidden {
+      display: none !important;
+    }
+
+    .ml-duo-ctab {
+      border: none;
+      background: transparent;
+      color: inherit;
+      font: inherit;
+      font-size: 13px;
+      font-weight: 500;
+      padding: 8px 12px;
+      border-radius: 6px;
+      cursor: pointer;
+      opacity: 0.72;
+      transition: background 0.15s ease, opacity 0.15s ease;
+      text-align: center;
+    }
+
+    .ml-duo-ctab:hover {
+      opacity: 0.95;
+    }
+
+    .ml-duo-ctab.is-active {
+      background: rgba(128, 128, 128, 0.28);
+      opacity: 1;
+      font-weight: 600;
+    }
+
     /* --- НАТИВНАЯ СЕКЦИЯ НАСТРОЕК ВНУТРИ ПАНЕЛИ MANGALIB --- */
     #ml-duo-settings-section,
     [data-ml-duo-settings="1"] {
@@ -875,7 +941,8 @@
     for (const el of candidates) {
       if (
         el.id === 'ml-duo-stage' ||
-        el.closest('#ml-duo-stage, #ml-duo-fallback-backdrop, [role="dialog"], [class*="modal"], [class*="drawer"], [class*="popup"], [class*="popover"]')
+        el.id === 'ml-duo-comment-tabs' ||
+        el.closest('#ml-duo-stage, #ml-duo-fallback-backdrop, #ml-duo-comment-tabs, [role="dialog"], [class*="modal"], [class*="drawer"], [class*="popup"], [class*="popover"]')
       ) {
         continue;
       }
@@ -910,7 +977,7 @@
   }
 
   // =========================================================================
-  // 4. ПОИСК КАРТИНОК, СКРЫТИЕ БЕЗ ЗАТРАГИВАНИЯ КОММЕНТОВ И РАЗВОРОТЫ
+  // 4. КАРТИНКИ, СИНХРОНИЗАЦИЯ КОММЕНТОВ И ВКЛАДКИ СТРАНИЦ
   // =========================================================================
 
   function containsComments(el) {
@@ -919,7 +986,7 @@
   }
 
   function isLikelyMangaImage(img) {
-    if (!img || img.closest('#ml-duo-stage, #ml-duo-settings-section, #ml-duo-fallback-backdrop')) return false;
+    if (!img || img.closest('#ml-duo-stage, #ml-duo-settings-section, #ml-duo-fallback-backdrop, #ml-duo-comment-tabs')) return false;
     if (img.closest('header, nav, footer, [role="dialog"], #comments, [id*="comment"], [class*="comment"]')) return false;
     const src = img.currentSrc || img.src || img.getAttribute('data-src') || '';
     if (!src) return false;
@@ -964,7 +1031,6 @@
       }
     }
 
-    // Фолбэк: прячем только обёртки каждой картинки, не трогая блок комментариев
     const targets = new Set();
     for (const img of images) {
       const wrap = img.closest('[data-p], [data-page]') || img;
@@ -1164,23 +1230,325 @@
     }
   }
 
-  function syncPageQueryParam(pageNum, routeOverride = null, notifySite = false) {
-    try {
-      const u = new URL(location.href);
-      if (routeOverride) {
-        u.pathname = buildChapterPathname(routeOverride);
-      }
-      if (!routeOverride && u.searchParams.get('p') === String(pageNum)) return;
-      u.searchParams.set('p', String(pageNum));
-      const nextHref = u.toString();
-      if (nextHref !== location.href) {
-        window.history.replaceState(window.history.state, '', nextHref);
-        currentUrl = nextHref;
-        if (notifySite) {
-          window.dispatchEvent(new PopStateEvent('popstate', { state: window.history.state }));
+  // --- Синхронизация скрытой родной читалки MangaLib с нужной страницей ---
+  function isNativeHorizontalReader() {
+    return chapterPages.length > 1 && getNativeReaderImages().length === 1;
+  }
+
+  function getNativeCurrentPage() {
+    const imgs = getNativeReaderImages();
+    if (imgs.length === 1 && chapterPages.length > 0) {
+      const src = imgs[0].currentSrc || imgs[0].src || '';
+      if (src) {
+        for (let i = 0; i < chapterPages.length; i++) {
+          const p = chapterPages[i];
+          if (p.image && src.includes(p.image)) return i + 1;
+          if (p.url) {
+            const cleanPath = p.url.replace(/^\/+/, '');
+            if (cleanPath && src.includes(cleanPath)) return i + 1;
+          }
         }
       }
+    }
+
+    if (chapterPages.length > 1) {
+      const total = String(chapterPages.length);
+      const nodes = document.querySelectorAll('header *, footer *, nav *, [data-ml-duo-chrome] *');
+      for (const el of nodes) {
+        if (el.children.length > 0) continue;
+        const m = (el.textContent || '').trim().match(/^(?:Страница\s+)?(\d+)\s*(?:\/|из)\s*(\d+)$/i);
+        if (m && m[2] === total) {
+          const n = Number(m[1]);
+          if (n >= 1 && n <= chapterPages.length) return n;
+        }
+      }
+    }
+
+    const p = Number(new URLSearchParams(location.search).get('p'));
+    return p >= 1 && p <= chapterPages.length ? p : 1;
+  }
+
+  function guessNativeNextKey() {
+    if (nativeNextKey) return nativeNextKey;
+    try {
+      for (let i = 0; i < localStorage.length; i++) {
+        const k = localStorage.key(i) || '';
+        if (!/reader|setting|manga/i.test(k)) continue;
+        const val = localStorage.getItem(k) || '';
+        if (/"rtl"|right-to-left|reverse.*true/i.test(val)) return 'ArrowLeft';
+      }
     } catch (_) {}
+    return 'ArrowRight';
+  }
+
+  function tryJumpViaNativeInput(targetPage) {
+    const total = chapterPages.length;
+    const selects = document.querySelectorAll('select');
+    for (const sel of selects) {
+      if (sel.closest('#ml-duo-stage, #ml-duo-settings-section, #ml-duo-fallback-backdrop, #ml-duo-comment-tabs')) continue;
+      if (sel.options.length === total) {
+        const opt = sel.options[targetPage - 1];
+        if (!opt) continue;
+        const setter = Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, 'value')?.set;
+        if (setter) setter.call(sel, opt.value);
+        else sel.value = opt.value;
+        sel.dispatchEvent(new Event('input', { bubbles: true }));
+        sel.dispatchEvent(new Event('change', { bubbles: true }));
+        return true;
+      }
+    }
+
+    const ranges = document.querySelectorAll('input[type="range"]');
+    for (const inp of ranges) {
+      if (inp.closest('#ml-duo-stage, #ml-duo-settings-section, #ml-duo-fallback-backdrop, #ml-duo-comment-tabs')) continue;
+      const max = Number(inp.max);
+      if (max === total || max === total - 1) {
+        const min = Number(inp.min) || 0;
+        const val = String(min === 0 ? targetPage - 1 : targetPage);
+        const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set;
+        if (setter) setter.call(inp, val);
+        else inp.value = val;
+        inp.dispatchEvent(new Event('input', { bubbles: true }));
+        inp.dispatchEvent(new Event('change', { bubbles: true }));
+        return true;
+      }
+    }
+    return false;
+  }
+
+  function dispatchNativeKey(keyName) {
+    const code = keyName === 'ArrowRight' ? 39 : 37;
+    isNativeSyncEvent = true;
+    try {
+      const ev = new KeyboardEvent('keydown', {
+        key: keyName,
+        code: keyName,
+        keyCode: code,
+        which: code,
+        bubbles: true,
+        cancelable: true
+      });
+      (document.body || document).dispatchEvent(ev);
+    } finally {
+      isNativeSyncEvent = false;
+    }
+  }
+
+  function dispatchNativeClick(side) {
+    const target = getNativeReaderImages()[0];
+    if (!target) return;
+    const rect = target.getBoundingClientRect();
+    const w = rect.width || window.innerWidth;
+    const h = rect.height || window.innerHeight;
+    const clientX = Math.round((rect.left || 0) + w * (side === 'right' ? 0.85 : 0.15));
+    const clientY = Math.round((rect.top || 0) + Math.max(10, h * 0.5));
+    isNativeSyncEvent = true;
+    try {
+      target.dispatchEvent(new MouseEvent('click', {
+        bubbles: true,
+        cancelable: true,
+        clientX,
+        clientY,
+        view: window
+      }));
+    } finally {
+      isNativeSyncEvent = false;
+    }
+  }
+
+  function syncPageQueryParam(pageNum, routeOverride = null, notifySite = false) {
+    clearTimeout(nativeSyncTimer);
+    clearTimeout(nativeStepTimer);
+
+    if (!notifySite || routeOverride || !isNativeHorizontalReader()) {
+      try {
+        const u = new URL(location.href);
+        if (routeOverride) u.pathname = buildChapterPathname(routeOverride);
+        if (!routeOverride && u.searchParams.get('p') === String(pageNum)) return;
+        u.searchParams.set('p', String(pageNum));
+        const nextHref = u.toString();
+        if (nextHref !== location.href) {
+          window.history.replaceState(window.history.state, '', nextHref);
+          currentUrl = nextHref;
+        }
+      } catch (_) {}
+      return;
+    }
+
+    const startKey = chapterKey;
+    const startPathname = location.pathname;
+
+    nativeSyncTimer = setTimeout(() => {
+      if (chapterKey !== startKey || location.pathname !== startPathname || !isNativeHorizontalReader()) return;
+      if (getNativeCurrentPage() === pageNum) return;
+
+      if (tryJumpViaNativeInput(pageNum)) {
+        nativeStepTimer = setTimeout(() => {
+          if (getNativeCurrentPage() !== pageNum) runStepLoop();
+        }, 50);
+        return;
+      }
+
+      runStepLoop();
+
+      function runStepLoop() {
+        let stepsLeft = chapterPages.length + 2;
+        let stuckCount = 0;
+
+        const nextStep = () => {
+          if (stepsLeft-- <= 0) return;
+          if (chapterKey !== startKey || location.pathname !== startPathname || !isNativeHorizontalReader()) return;
+
+          const cur = getNativeCurrentPage();
+          if (cur === pageNum) return;
+
+          const wantNext = pageNum > cur;
+          const nextKey = guessNativeNextKey();
+          const prevKey = nextKey === 'ArrowRight' ? 'ArrowLeft' : 'ArrowRight';
+          const keyToSend = wantNext ? nextKey : prevKey;
+
+          const nextSide = nativeNextSide;
+          const prevSide = nextSide === 'right' ? 'left' : 'right';
+          const sideToClick = wantNext ? nextSide : prevSide;
+
+          if (!nativeUseClick) dispatchNativeKey(keyToSend);
+          else dispatchNativeClick(sideToClick);
+
+          nativeStepTimer = setTimeout(() => {
+            if (location.pathname !== startPathname) {
+              if (!nativeUseClick) nativeNextKey = keyToSend === 'ArrowRight' ? 'ArrowLeft' : 'ArrowRight';
+              else nativeNextSide = sideToClick === 'right' ? 'left' : 'right';
+              window.history.back();
+              return;
+            }
+
+            const after = getNativeCurrentPage();
+            if (after !== cur) {
+              stuckCount = 0;
+              const wentForward = after > cur;
+              if (!nativeUseClick) {
+                nativeNextKey = wentForward ? keyToSend : (keyToSend === 'ArrowRight' ? 'ArrowLeft' : 'ArrowRight');
+              } else {
+                nativeNextSide = wentForward ? sideToClick : (sideToClick === 'right' ? 'left' : 'right');
+              }
+              if (after !== pageNum) nextStep();
+            } else {
+              stuckCount++;
+              if (!nativeUseClick && stuckCount === 1) {
+                nativeUseClick = true;
+                nextStep();
+              }
+            }
+          }, 40);
+        };
+
+        nextStep();
+      }
+    }, 180);
+  }
+
+  // --- Вкладки комментариев (левая / правая страница разворота) ---
+  function findNativeCommentsAnchor() {
+    const selectors = [
+      '#comments',
+      '[data-comments]',
+      'section[class*="comment"]',
+      'div[class*="comments"]'
+    ];
+    for (const sel of selectors) {
+      const nodes = document.querySelectorAll(sel);
+      for (const el of nodes) {
+        if (el.closest('#ml-duo-stage, #ml-duo-settings-section, #ml-duo-fallback-backdrop, #ml-duo-comment-tabs, header, nav, footer, [data-ml-duo-chrome], [role="dialog"]')) {
+          continue;
+        }
+        if (el.offsetParent === null) continue;
+        if (el.getBoundingClientRect().width < 240) continue;
+        return el;
+      }
+    }
+    return null;
+  }
+
+  function removeCommentTabs() {
+    const bar = document.getElementById('ml-duo-comment-tabs');
+    if (bar) bar.remove();
+  }
+
+  function ensureCommentTabsEl() {
+    const anchor = findNativeCommentsAnchor();
+    if (!anchor || !anchor.parentElement) return null;
+
+    let bar = document.getElementById('ml-duo-comment-tabs');
+    if (!bar) {
+      bar = document.createElement('div');
+      bar.id = 'ml-duo-comment-tabs';
+      bar.innerHTML = `
+        <button type="button" class="ml-duo-ctab" data-pos="left"></button>
+        <button type="button" class="ml-duo-ctab" data-pos="right"></button>
+      `;
+
+      bar.addEventListener('click', (e) => {
+        const btn = e.target.closest('.ml-duo-ctab');
+        if (!btn) return;
+        e.preventDefault();
+        e.stopPropagation();
+
+        const targetPage = Number(btn.dataset.page);
+        if (!targetPage || targetPage === commentTabsState.activePage) return;
+
+        commentTabsState.activePage = targetPage;
+        renderCommentTabsUI();
+        syncPageQueryParam(targetPage, null, true);
+      });
+    }
+
+    if (bar.nextElementSibling !== anchor) {
+      anchor.insertAdjacentElement('beforebegin', bar);
+    }
+
+    return bar;
+  }
+
+  function renderCommentTabsUI() {
+    if (!isReaderPage() || !settings.enabled) {
+      removeCommentTabs();
+      return;
+    }
+
+    const bar = ensureCommentTabsEl();
+    if (!bar) return;
+
+    const { leftPage, rightPage, activePage } = commentTabsState;
+
+    // Автоматически скрываем вкладки на одиночных страницах (обложка, широкий скан, последняя непарная)
+    if (!leftPage || !rightPage) {
+      bar.classList.add('is-hidden');
+      return;
+    }
+
+    bar.classList.remove('is-hidden');
+
+    const leftBtn = bar.querySelector('[data-pos="left"]');
+    const rightBtn = bar.querySelector('[data-pos="right"]');
+
+    leftBtn.dataset.page = String(leftPage);
+    leftBtn.textContent = `← Стр. ${leftPage}`;
+    leftBtn.classList.toggle('is-active', activePage === leftPage);
+
+    rightBtn.dataset.page = String(rightPage);
+    rightBtn.textContent = `Стр. ${rightPage} →`;
+    rightBtn.classList.toggle('is-active', activePage === rightPage);
+  }
+
+  function updateCommentTabsForSlots(slots, defaultActivePage) {
+    const leftPage = (!slots?.solo && slots?.left) ? slots.left.index + 1 : null;
+    const rightPage = (!slots?.solo && slots?.right) ? slots.right.index + 1 : null;
+
+    commentTabsState.leftPage = leftPage;
+    commentTabsState.rightPage = rightPage;
+    commentTabsState.activePage = defaultActivePage || rightPage || leftPage || null;
+
+    renderCommentTabsUI();
   }
 
   // =========================================================================
@@ -1256,8 +1624,9 @@
       stage.appendChild(book);
     }
 
-    // Синхронизируем номер текущей страницы с URL и комментариями MangaLib
-    syncPageQueryParam(group.pages[0] + 1, null, true);
+    const firstPage = group.pages[0] + 1;
+    updateCommentTabsForSlots(slots, firstPage);
+    syncPageQueryParam(firstPage, null, true);
 
     preloadSpread(groups, currentSpreadIndex + 1);
     preloadSpread(groups, currentSpreadIndex + 2);
@@ -1544,7 +1913,7 @@
 
     if (!curl.isDragging) {
       if (Math.hypot(dx, dy) < 8) return;
-      // Если жест вертикальный — отдаём прокрутку браузеру, чтобы листать вниз к комментариям
+      // Вертикальный свайп отдаём браузеру, чтобы листать вниз к комментариям
       if (Math.abs(dy) > Math.abs(dx) * 1.2) {
         cleanupPagedDragListeners();
         curl.active = false;
@@ -1691,6 +2060,8 @@
       wrap.className = 'ml-duo-strip-spread';
       wrap.dataset.chapterKey = route.key;
       wrap.dataset.firstPage = String(group.pages[0] + 1);
+      wrap.dataset.leftPage = (!slots.solo && slots.left) ? String(slots.left.index + 1) : '';
+      wrap.dataset.rightPage = (!slots.solo && slots.right) ? String(slots.right.index + 1) : '';
 
       if (slots.solo) {
         wrap.appendChild(createPageImg(slots.solo));
@@ -1737,6 +2108,14 @@
     track.className = 'ml-duo-strip-track';
     track.appendChild(buildStripChapterNodes(route, chapterPages, false));
     stage.appendChild(track);
+
+    const groups = computeSpreadGroups(chapterPages);
+    const initGroup = groups[Math.max(0, Math.min(currentSpreadIndex, groups.length - 1))];
+    if (initGroup) {
+      const initSlots = mapGroupToSlots(initGroup, chapterPages);
+      updateCommentTabsForSlots(initSlots, initGroup.pages[0] + 1);
+      syncPageQueryParam(initGroup.pages[0] + 1, null, true);
+    }
 
     const alignInitialScroll = () => {
       if (stripState.userScrolled) return;
@@ -1876,8 +2255,14 @@
         const pageNum = Number(best.dataset.firstPage) || 1;
         const ch = stripState.chaptersData.get(key);
         const notify = key === chapterKey;
+
+        commentTabsState.leftPage = notify ? (Number(best.dataset.leftPage) || null) : null;
+        commentTabsState.rightPage = notify ? (Number(best.dataset.rightPage) || null) : null;
+        commentTabsState.activePage = pageNum;
+        renderCommentTabsUI();
+
         if (ch?.route) {
-          syncPageQueryParam(pageNum, ch.route, notify);
+          syncPageQueryParam(pageNum, notify ? null : ch.route, notify);
         } else {
           syncPageQueryParam(pageNum, null, notify);
         }
@@ -1887,7 +2272,6 @@
 
   function onStripWheel(e) {
     if (settings.readingMode !== 'strip' || isAnyModalOpen() || window.scrollY > 10) return;
-    // С зажатым Shift колёсико скроллит страницу вертикально (например, вниз к комментариям)
     if (e.shiftKey) return;
 
     const stage = document.getElementById('ml-duo-stage');
@@ -2044,7 +2428,7 @@
   function goToAdjacentChapter(direction) {
     const curRoute = parseChapterRoute();
     const links = Array.from(document.querySelectorAll('a[href]')).filter(a => {
-      if (a.closest('#ml-duo-stage, #ml-duo-settings-section, #ml-duo-fallback-backdrop')) return false;
+      if (a.closest('#ml-duo-stage, #ml-duo-settings-section, #ml-duo-fallback-backdrop, #ml-duo-comment-tabs')) return false;
       try {
         const u = new URL(a.href, location.origin);
         if (u.pathname === location.pathname) return false;
@@ -2082,10 +2466,17 @@
 
   function cleanupDuoStage() {
     stopCurlAnimation();
+    clearTimeout(nativeSyncTimer);
+    clearTimeout(nativeStepTimer);
     cleanupPagedDragListeners();
     curl.active = false;
     curl.isDragging = false;
     resetStripState();
+
+    removeCommentTabs();
+    commentTabsState.leftPage = null;
+    commentTabsState.rightPage = null;
+    commentTabsState.activePage = null;
 
     const stage = document.getElementById('ml-duo-stage');
     if (stage) stage.remove();
@@ -2131,6 +2522,8 @@
         renderStaticCurrentSpread();
       }
     }
+
+    renderCommentTabsUI();
   }
 
   function scheduleRender() {
@@ -2393,6 +2786,8 @@
 
     if (!prevRoute || prevRoute.key !== nextRoute.key) {
       stopCurlAnimation();
+      clearTimeout(nativeSyncTimer);
+      clearTimeout(nativeStepTimer);
       chapterPages = [];
       pagesFromApi = false;
       chapterKey = '';
@@ -2400,6 +2795,9 @@
       currentSpreadIndex = 0;
       uiHidden = settings.cleanScreen;
       resetStripState();
+      commentTabsState.leftPage = null;
+      commentTabsState.rightPage = null;
+      commentTabsState.activePage = null;
 
       const stage = document.getElementById('ml-duo-stage');
       if (stage) stage.remove();
@@ -2411,6 +2809,7 @@
 
   function setupListeners() {
     window.addEventListener('keydown', (e) => {
+      if (isNativeSyncEvent) return;
       if (!isReaderPage()) return;
 
       const tag = (e.target?.tagName || '').toUpperCase();
@@ -2511,7 +2910,7 @@
       let needSettings = false;
 
       for (const m of mutations) {
-        if (m.target?.closest?.('#ml-duo-stage, #ml-duo-settings-section, #ml-duo-fallback-backdrop')) {
+        if (m.target?.closest?.('#ml-duo-stage, #ml-duo-settings-section, #ml-duo-fallback-backdrop, #ml-duo-comment-tabs')) {
           continue;
         }
         if (m.type === 'childList' && (m.addedNodes.length || m.removedNodes.length)) {
