@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MangaLib Duo
 // @namespace    https://github.com/kakosina/mangalib-duo
-// @version      2.9.1
+// @version      3.0.0
 // @description  Double-Page Reader for Mangalib
 // @author       kakosina
 // @match        https://mangalib.org/*
@@ -20,17 +20,18 @@
 // @updateURL    https://raw.githubusercontent.com/kakosina/mangalib-duo/main/mangalib-duo.user.js
 // ==/UserScript==
 
-
 (function () {
   'use strict';
 
-  const STORAGE_KEY = 'mangalib_duo_settings_v291';
+  const STORAGE_KEY = 'mangalib_duo_settings_v300';
+  const COMMENTS_FLAG_KEY = 'ml_duo_open_comments_after_nav';
 
   const DEFAULT_SETTINGS = {
     enabled: true,           // Двустраничный режим (Alt+D)
+    readingMode: 'paged',    // 'paged' (постранично) | 'strip' (бесконечная полоса вбок)
     firstPageSide: 'right',  // 'right' (манга: 2 | 1) | 'left' (комикс: 1 | 2)
-    rtlNav: true,            // Листать справа налево (левая сторона / ← = вперёд)
-    flipAnimation: true,     // Интерактивное 3D-перелистывание книги
+    rtlNav: true,            // Листать справа налево (манга)
+    pageCurl: true,          // Чистая книжная анимация страницы (выкл = без анимации совсем)
     coverAlone: false,       // Обложка отдельно (сдвиг парности, Alt+S)
     autoWide: true,          // Широкие сканы целиком
     cleanScreen: true        // Скрывать верхнее и нижнее меню при открытии главы
@@ -39,9 +40,7 @@
   function loadSettings() {
     try {
       let raw = null;
-      if (typeof GM_getValue === 'function') {
-        raw = GM_getValue(STORAGE_KEY, null);
-      }
+      if (typeof GM_getValue === 'function') raw = GM_getValue(STORAGE_KEY, null);
       if (!raw) raw = localStorage.getItem(STORAGE_KEY);
       if (!raw) return { ...DEFAULT_SETTINGS };
       const parsed = typeof raw === 'string' ? JSON.parse(raw) : raw;
@@ -53,6 +52,7 @@
 
   function saveSettings(patch) {
     const prevEnabled = settings.enabled;
+    const prevMode = settings.readingMode;
     settings = { ...settings, ...patch };
     try {
       const serialized = JSON.stringify(settings);
@@ -68,8 +68,14 @@
       } else {
         applyCleanScreenState(settings.cleanScreen);
       }
-    } else if ('cleanScreen' in patch && isReaderPage() && settings.enabled) {
+    } else if ('cleanScreen' in patch && isReaderPage() && settings.enabled && !commentsOpen) {
       applyCleanScreenState(settings.cleanScreen);
+    }
+
+    if (prevMode !== settings.readingMode) {
+      resetStripState();
+      const stage = document.getElementById('ml-duo-stage');
+      if (stage) stage.dataset.sig = '';
     }
 
     scheduleRender();
@@ -77,11 +83,14 @@
 
   let settings = loadSettings();
 
-  // Состояние главы
-  let chapterPages = [];          // [{ index, url, image, fullUrl, width, height }]
+  // Состояние текущей главы и серверов картинок
+  let chapterPages = [];
   let pagesFromApi = false;
   let chapterKey = '';
-  let cdnOrigin = '';             // Определяется из реально загруженных картинок сайта
+  let initialDomRouteKey = '';    // Какая глава реально отрендерена самой читалкой MangaLib (для комментариев)
+  let activeChapterRoute = null;  // Текущая видимая глава (включая подгруженные в бесконечной полосе)
+  let cdnOrigin = '';
+  let imageServersLoaded = false;
   let fallbackServers = [
     'https://img33.imgslib.link',
     'https://img3.imgslib.link',
@@ -89,58 +98,98 @@
     'https://img2.mixlib.me'
   ];
 
+  // Кэш списка глав тайтла (для бесконечной подгрузки в горизонтальной полосе)
+  let mangaChaptersCache = { slug: '', list: null, loading: false };
+
   let currentSpreadIndex = 0;
   let openAtLastSpread = false;
   let lastSpreadChangeAt = 0;
   let apiFetchInFlightFor = '';
   let renderRaf = null;
-  let animTimer = null;
+  let animRaf = null;
   let currentUrl = location.href;
   let hiddenNativeContainer = null;
   let uiHidden = settings.cleanScreen;
+  let commentsOpen = false;
 
-  // Состояние интерактивного перелистывания (мышь + палец)
-  const drag = {
+  // Размеры книги (1 страница = pageW x pageH)
+  let bookMetrics = { pageW: 500, pageH: 720, left: 0, top: 0 };
+
+  // Состояние бесконечной горизонтальной полосы
+  const stripState = {
+    loadedKeys: new Set(),
+    lastLoadedRoute: null,
+    loadingNext: false,
+    noMoreChapters: false,
+    userScrolled: false,
+    scrollTimer: null,
+    chaptersData: new Map(), // key -> { route, pages }
+    panActive: false,
+    panPointerId: null,
+    panStartX: 0,
+    panStartY: 0,
+    panStartScroll: 0,
+    panMoved: false
+  };
+
+  // Состояние интерактивного перелистывания (мышь + палец) в постраничном режиме
+  const curl = {
     active: false,
     pointerId: null,
     isDragging: false,
+    isAnimating: false,
+    canCurl: false,
     startX: 0,
     startY: 0,
+    startBookX: 0,
+    startBookY: 0,
     lastX: 0,
     lastTime: 0,
     vx: 0,
-    side: 'left',       // 'left' | 'right' — с какой половины схватили
-    turnDir: 'l2r',     // 'l2r' (лист слева направо) | 'r2l' (лист справа налево)
-    stepDelta: 1,       // +1 (вперёд) | -1 (назад)
+    turnDir: 'l2r',
+    stepDelta: 1,
     targetIndex: 0,
-    isBoundary: false,  // Край главы (переход на соседнюю главу)
-    is3D: true,
+    isBoundary: false,
+    bx: 0,
+    dy: 0,
     progress: 0,
-    nodes: null         // DOM-ссылки на элементы текущего переворота
+    nodes: null
   };
 
-  let isAnimatingFinish = false;
-
   // =========================================================================
-  // 1. МАРШРУТЫ, ЗАГРУЗКА СТРАНИЦ БЕЗ ПЕРЕХВАТА FETCH/XHR И СБОРКА URL
+  // 1. МАРШРУТЫ, API ГЛАВ И СБОРКА URL КАРТИНОК
   // =========================================================================
 
   function parseChapterRoute(pathname = location.pathname) {
-    const m = pathname.match(/(?:\/[a-z]{2})?(?:\/manga)?\/([^/]+)\/(?:read\/)?v([^/]+)\/c([^/?#]+)/i);
+    const m = pathname.match(/^(\/[a-z]{2})?(?:\/manga)?\/([^/]+)\/(read\/)?v([^/]+)\/c([^/?#]+)/i);
     if (!m) return null;
     return {
-      slug: m[1],
-      volume: m[2],
-      number: m[3],
-      key: `${m[1]}_${m[2]}_${m[3]}`
+      langPrefix: m[1] || '',
+      slug: m[2],
+      hasRead: Boolean(m[3]),
+      volume: m[4],
+      number: m[5],
+      key: `${m[2]}_${m[4]}_${m[5]}`
     };
+  }
+
+  function buildChapterPathname(route) {
+    const lang = route.langPrefix || '';
+    const readPart = route.hasRead ? 'read/' : 'read/';
+    return `${lang}/manga/${route.slug}/${readPart}v${route.volume}/c${route.number}`;
   }
 
   function isReaderPage(pathname = location.pathname) {
     return Boolean(parseChapterRoute(pathname));
   }
 
-  // Отличаем реальный URL с доменом (https://... или //img3.imgslib.link/...) от пути //manga/...
+  function compareChapterOrder(a, b) {
+    const va = parseFloat(a.volume) || 0;
+    const vb = parseFloat(b.volume) || 0;
+    if (va !== vb) return va - vb;
+    return (parseFloat(a.number) || 0) - (parseFloat(b.number) || 0);
+  }
+
   function isRealFullUrl(u) {
     if (!u || typeof u !== 'string') return false;
     if (/^https?:\/\//i.test(u)) return true;
@@ -168,13 +217,9 @@
     if (rawUrl) {
       let path = rawUrl;
       if (isRealFullUrl(rawUrl)) {
-        try {
-          path = new URL(normalizeFullUrl(rawUrl)).pathname;
-        } catch (_) {}
+        try { path = new URL(normalizeFullUrl(rawUrl)).pathname; } catch (_) {}
       }
-      if (singleSlash) {
-        return host + '/' + path.replace(/^\/+/, '');
-      }
+      if (singleSlash) return host + '/' + path.replace(/^\/+/, '');
       return host + (path.startsWith('/') ? path : '/' + path);
     }
 
@@ -195,6 +240,38 @@
     }
   }
 
+  function getApiHeaders() {
+    const headers = { Accept: 'application/json', 'Site-Id': '1' };
+    const token = getMangaLibAuthToken();
+    if (token) headers.Authorization = `Bearer ${token}`;
+    return headers;
+  }
+
+  async function loadImageServersOnce() {
+    if (imageServersLoaded) return;
+    imageServersLoaded = true;
+    try {
+      const res = await fetch('https://api.cdnlibs.org/api/constants?fields[]=imageServers', {
+        headers: { Accept: 'application/json', 'Site-Id': '1' },
+        credentials: 'omit'
+      });
+      if (!res.ok) return;
+      const json = await res.json();
+      const servers = json?.data?.imageServers;
+      if (!Array.isArray(servers)) return;
+      const mangaServers = servers
+        .filter(s => s && typeof s.url === 'string' && (!Array.isArray(s.site_ids) || s.site_ids.includes(1)))
+        .map(s => s.url.replace(/\/+$/, ''));
+      if (mangaServers.length) {
+        fallbackServers = Array.from(new Set([...mangaServers, ...fallbackServers]));
+        if (!cdnOrigin) {
+          cdnOrigin = mangaServers[0];
+          scheduleRender();
+        }
+      }
+    } catch (_) {}
+  }
+
   function detectCdnFromBrowser() {
     const nativeImgs = getNativeReaderImages();
     for (const img of nativeImgs) {
@@ -212,19 +289,16 @@
       }
     }
 
-    // Проверяем также журнал загруженных ресурсов браузера (без модификации fetch/XHR)
     try {
       const entries = performance.getEntriesByType('resource');
       for (let i = entries.length - 1; i >= 0; i--) {
         const name = entries[i].name || '';
-        if (/\/manga\/.+\.(jpe?g|png|webp|avif|gif)/i.test(name) || /imgslib|mixlib|cdnlibs/i.test(name)) {
-          if (/\.(jpe?g|png|webp|avif|gif)(\?|$)/i.test(name)) {
-            const origin = new URL(name).origin;
-            if (origin && origin !== location.origin) {
-              cdnOrigin = origin;
-              if (!fallbackServers.includes(origin)) fallbackServers.unshift(origin);
-              return origin;
-            }
+        if (/\/manga\/|imgslib|mixlib|cdnlibs/i.test(name) && /\.(jpe?g|png|webp|avif|gif)(\?|$)/i.test(name)) {
+          const origin = new URL(name).origin;
+          if (origin && origin !== location.origin) {
+            cdnOrigin = origin;
+            if (!fallbackServers.includes(origin)) fallbackServers.unshift(origin);
+            return origin;
           }
         }
       }
@@ -247,15 +321,7 @@
     return '';
   }
 
-  async function loadChapterFromApi() {
-    const route = parseChapterRoute();
-    if (!route) return;
-    if (pagesFromApi && chapterKey === route.key && chapterPages.length > 0) return;
-    if (apiFetchInFlightFor === route.key) return;
-    apiFetchInFlightFor = route.key;
-
-    const search = new URLSearchParams(location.search);
-    const branchId = search.get('bid') || search.get('branch_id') || '';
+  async function fetchChapterPagesByRoute(route, branchId = '') {
     const qs = new URLSearchParams({ number: route.number, volume: route.volume });
     if (branchId) qs.set('branch_id', branchId);
 
@@ -266,9 +332,7 @@
       `${location.origin}/api/manga/${encodeURIComponent(route.slug)}/chapter?${qs.toString()}`
     ].filter(Boolean)));
 
-    const headers = { Accept: 'application/json', 'Site-Id': '1' };
-    const token = getMangaLibAuthToken();
-    if (token) headers.Authorization = `Bearer ${token}`;
+    const headers = getApiHeaders();
 
     for (const url of candidateUrls) {
       try {
@@ -277,26 +341,93 @@
         const json = await res.json();
         const data = json?.data || json;
         if (!data || !Array.isArray(data.pages) || !data.pages.length) continue;
+        return data.pages.map((p, idx) => {
+          const u = p.url || '';
+          return {
+            index: idx,
+            url: u,
+            image: p.image || '',
+            fullUrl: isRealFullUrl(u) ? normalizeFullUrl(u) : '',
+            width: Number(p.width) || 0,
+            height: Number(p.height) || 0
+          };
+        });
+      } catch (_) {}
+    }
+    return null;
+  }
 
-        // Проверяем, что пользователь ещё на той же главе
-        const nowRoute = parseChapterRoute();
-        if (!nowRoute || nowRoute.key !== route.key) return;
+  async function fetchMangaChaptersList(slug) {
+    if (mangaChaptersCache.slug === slug && Array.isArray(mangaChaptersCache.list)) {
+      return mangaChaptersCache.list;
+    }
+    if (mangaChaptersCache.loading) return null;
+    mangaChaptersCache.loading = true;
 
-        applyPagesList(data.pages, route.key, true);
-        return;
+    const urls = [
+      `https://api.cdnlibs.org/api/manga/${encodeURIComponent(slug)}/chapters`,
+      `${location.origin}/api/manga/${encodeURIComponent(slug)}/chapters`
+    ];
+    const headers = getApiHeaders();
+
+    for (const url of urls) {
+      try {
+        const res = await fetch(url, { headers, credentials: 'omit' });
+        if (!res.ok) continue;
+        const json = await res.json();
+        const raw = json?.data;
+        if (!Array.isArray(raw) || !raw.length) continue;
+
+        const sorted = raw
+          .filter(c => c && c.volume != null && c.number != null)
+          .map(c => ({
+            volume: String(c.volume),
+            number: String(c.number),
+            name: c.name || '',
+            branches: Array.isArray(c.branches) ? c.branches : []
+          }))
+          .sort(compareChapterOrder);
+
+        mangaChaptersCache = { slug, list: sorted, loading: false };
+        return sorted;
       } catch (_) {}
     }
 
-    // Если API не ответил — пробуем ещё раз чуть позже (если пользователь остался на главе)
-    if (apiFetchInFlightFor === route.key) {
-      apiFetchInFlightFor = '';
-    }
+    mangaChaptersCache.loading = false;
+    return null;
   }
 
-  function applyPagesList(rawPages, key, fromApi) {
+  async function loadCurrentChapterFromApi() {
+    const route = parseChapterRoute();
+    if (!route) return;
+    if (pagesFromApi && chapterKey === route.key && chapterPages.length > 0) return;
+    if (apiFetchInFlightFor === route.key) return;
+    apiFetchInFlightFor = route.key;
+
+    loadImageServersOnce();
+
+    const search = new URLSearchParams(location.search);
+    const branchId = search.get('bid') || search.get('branch_id') || '';
+    const pages = await fetchChapterPagesByRoute(route, branchId);
+
+    const nowRoute = parseChapterRoute();
+    if (pages && nowRoute && nowRoute.key === route.key) {
+      applyPagesList(pages, route, true);
+      return;
+    }
+
+    if (apiFetchInFlightFor === route.key) apiFetchInFlightFor = '';
+  }
+
+  function applyPagesList(rawPages, route, fromApi) {
+    const key = route ? route.key : 'dom';
     const isSame = key === chapterKey && pagesFromApi === fromApi && chapterPages.length === rawPages.length;
     chapterKey = key;
     pagesFromApi = fromApi;
+    if (route) {
+      activeChapterRoute = route;
+      if (!initialDomRouteKey) initialDomRouteKey = route.key;
+    }
 
     chapterPages = rawPages.map((p, idx) => {
       const u = p.url || '';
@@ -304,7 +435,7 @@
         index: idx,
         url: u,
         image: p.image || '',
-        fullUrl: isRealFullUrl(u) ? normalizeFullUrl(u) : (p.fullUrl || ''),
+        fullUrl: p.fullUrl || (isRealFullUrl(u) ? normalizeFullUrl(u) : ''),
         width: Number(p.width) || 0,
         height: Number(p.height) || 0
       };
@@ -331,7 +462,7 @@
   }
 
   // =========================================================================
-  // 2. СТИЛИ (НАТИВНОЕ МЕНЮ + ИНТЕРАКТИВНАЯ 3D-КНИГА + ЧИСТЫЙ ЭКРАН)
+  // 2. СТИЛИ (ЧИСТАЯ КНИГА БЕЗ ТЕНЕЙ, ПОЛОСА ВБОК, КОММЕНТАРИИ, РОДНОЕ МЕНЮ)
   // =========================================================================
 
   const STYLES = `
@@ -342,7 +473,6 @@
       overscroll-behavior: none !important;
     }
 
-    /* Чистый экран: прячем и показываем родные панели MangaLib */
     [data-ml-duo-chrome="top"],
     [data-ml-duo-chrome="bottom"] {
       z-index: 60 !important;
@@ -361,7 +491,6 @@
       transform: translateY(100%) !important;
     }
 
-    /* Аккуратное скрытие штатной ленты (без удаления узлов React/Vue) */
     .ml-duo-native-masked {
       visibility: hidden !important;
       pointer-events: none !important;
@@ -369,82 +498,211 @@
       overflow: hidden !important;
     }
 
-    /* --- СЦЕНА ИНТЕРАКТИВНОЙ КНИГИ --- */
+    /* В режиме комментариев полностью сворачиваем картинки читалки, чтобы сразу видеть комментарии */
+    .ml-duo-native-collapsed {
+      display: none !important;
+    }
+
+    /* --- ОСНОВНАЯ СЦЕНА --- */
     #ml-duo-stage {
       position: fixed;
       inset: 0;
       width: 100vw;
       height: 100vh;
       z-index: 15;
+      background: var(--ml-duo-bg, #141414);
+      user-select: none;
+      -webkit-user-select: none;
+    }
+
+    /* Постраничный режим */
+    #ml-duo-stage.mode-paged {
       display: flex;
       align-items: center;
       justify-content: center;
       overflow: hidden;
-      user-select: none;
-      -webkit-user-select: none;
       touch-action: none;
-      cursor: grab;
-      background: var(--ml-duo-bg, #141414);
+      cursor: default;
     }
 
-    #ml-duo-stage.is-dragging {
+    #ml-duo-stage.mode-paged.can-grab {
+      cursor: grab;
+    }
+
+    #ml-duo-stage.mode-paged.is-dragging {
       cursor: grabbing;
     }
 
-    .ml-duo-viewport {
-      position: relative;
-      width: 100%;
-      height: 100%;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      perspective: 2400px;
-      perspective-origin: 50% 50%;
+    /* Режим бесконечной горизонтальной полосы */
+    #ml-duo-stage.mode-strip {
+      display: block;
+      overflow-x: auto;
+      overflow-y: hidden;
+      touch-action: pan-x;
+      -webkit-overflow-scrolling: touch;
+      scrollbar-width: none;
+      cursor: grab;
     }
 
-    .ml-duo-spread {
-      position: relative;
-      width: 100%;
-      height: 100%;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      transform-style: preserve-3d;
-      will-change: transform;
+    #ml-duo-stage.mode-strip::-webkit-scrollbar {
+      display: none;
     }
 
-    .ml-duo-slot {
-      position: relative;
-      width: 50%;
-      height: 100%;
+    #ml-duo-stage.mode-strip.is-dragging {
+      cursor: grabbing;
+    }
+
+    .ml-duo-strip-track {
       display: flex;
+      flex-direction: row;
       align-items: center;
-      min-width: 0;
+      height: 100vh;
+      width: max-content;
+      gap: 18px;
+      padding: 0 24px;
       box-sizing: border-box;
     }
 
-    .ml-duo-slot.is-left  { justify-content: flex-end; }
-    .ml-duo-slot.is-right { justify-content: flex-start; }
-
-    .ml-duo-solo-slot {
-      position: relative;
-      width: 100%;
-      height: 100%;
+    .ml-duo-strip-spread {
+      flex: 0 0 auto;
+      height: 100vh;
       display: flex;
       align-items: center;
       justify-content: center;
     }
 
-    .ml-duo-sheet {
-      position: relative;
-      display: inline-flex;
-      max-width: 100%;
-      max-height: 100%;
-      overflow: hidden;
+    .ml-duo-strip-spread > img {
+      display: block;
+      max-height: 100vh;
+      max-width: 100vw;
+      width: auto;
+      height: auto;
+      object-fit: contain;
+      pointer-events: none;
+      -webkit-user-drag: none;
     }
 
-    .ml-duo-sheet > img {
+    .ml-duo-strip-pair {
+      display: flex;
+      flex-direction: row;
+      align-items: center;
+      justify-content: center;
+      height: 100vh;
+    }
+
+    .ml-duo-strip-pair > img {
       display: block;
+      max-height: 100vh;
+      max-width: 50vw;
+      width: auto;
+      height: auto;
+      object-fit: contain;
+      pointer-events: none;
+      -webkit-user-drag: none;
+    }
+
+    /* Аккуратный вертикальный разделитель глав в бесконечной полосе */
+    .ml-duo-strip-divider {
+      flex: 0 0 auto;
+      height: 70vh;
+      min-width: 160px;
+      padding: 20px;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 12px;
+      border-left: 1px solid rgba(128, 128, 128, 0.22);
+      border-right: 1px solid rgba(128, 128, 128, 0.22);
+      color: inherit;
+      text-align: center;
+      box-sizing: border-box;
+    }
+
+    .ml-duo-strip-div-title {
+      font-size: 13px;
+      font-weight: 600;
+      opacity: 0.78;
+    }
+
+    .ml-duo-strip-div-btn {
+      border: 1px solid rgba(128, 128, 128, 0.35);
+      background: rgba(128, 128, 128, 0.14);
+      color: inherit;
+      font: inherit;
+      font-size: 13px;
+      padding: 6px 12px;
+      border-radius: 6px;
+      cursor: pointer;
+    }
+
+    .ml-duo-strip-div-btn:hover {
+      background: rgba(128, 128, 128, 0.26);
+    }
+
+    /* --- ПОСТРАНИЧНАЯ КНИГА (ЧИСТАЯ, БЕЗ ТЕНЕЙ И 3D-ЭФФЕКТОВ) --- */
+    .ml-duo-book {
+      position: relative;
+      overflow: visible;
+      flex-shrink: 0;
+    }
+
+    .ml-duo-layer {
+      position: absolute;
+      inset: 0;
+      pointer-events: none;
+    }
+
+    .ml-duo-page-box {
+      position: absolute;
+      top: 0;
+      overflow: hidden;
+      display: flex;
+      align-items: center;
+      background: transparent;
+    }
+
+    .ml-duo-page-box.is-left {
+      left: 0;
+      justify-content: flex-end;
+    }
+
+    .ml-duo-page-box.is-right {
+      right: 0;
+      justify-content: flex-start;
+    }
+
+    .ml-duo-page-box.is-back {
+      left: 0;
+      top: 0;
+      transform-origin: 0 0;
+      will-change: transform;
+    }
+
+    .ml-duo-page-box > img {
+      display: block;
+      width: 100%;
+      height: 100%;
+      object-fit: contain;
+      pointer-events: none;
+      -webkit-user-drag: none;
+    }
+
+    .ml-duo-page-box.is-left > img  { object-position: right center; }
+    .ml-duo-page-box.is-right > img { object-position: left center; }
+
+    .ml-duo-solo-wrap {
+      position: relative;
+      width: 100vw;
+      height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+
+    .ml-duo-solo-wrap > img {
+      display: block;
+      max-width: 100vw;
       max-height: 100vh;
       width: auto;
       height: auto;
@@ -453,86 +711,36 @@
       -webkit-user-drag: none;
     }
 
-    .ml-duo-slot .ml-duo-sheet > img      { max-width: 50vw; }
-    .ml-duo-solo-slot .ml-duo-sheet > img { max-width: 100vw; }
-
-    /* Тень сгиба у корешка книги */
-    #ml-duo-stage.ml-book-fx .ml-duo-sheet.is-left-page::after {
-      content: "";
-      position: absolute;
-      inset: 0;
-      pointer-events: none;
-      background: linear-gradient(
-        to left,
-        rgba(0, 0, 0, 0.30) 0%,
-        rgba(0, 0, 0, 0.10) 10px,
-        transparent 34px
-      );
+    .ml-curl-front {
+      z-index: 4;
+      will-change: clip-path;
     }
 
-    #ml-duo-stage.ml-book-fx .ml-duo-sheet.is-right-page::after {
-      content: "";
-      position: absolute;
-      inset: 0;
-      pointer-events: none;
-      background: linear-gradient(
-        to right,
-        rgba(0, 0, 0, 0.30) 0%,
-        rgba(0, 0, 0, 0.10) 10px,
-        transparent 34px
-      );
+    .ml-curl-flap {
+      z-index: 5;
+      will-change: clip-path;
     }
 
-    /* 3D-лист, который тянет пользователь пальцем или мышкой */
-    .ml-duo-flipper {
-      position: absolute;
-      top: 0;
-      height: 100%;
-      width: 50%;
-      transform-style: preserve-3d;
-      z-index: 6;
-      pointer-events: none;
-      will-change: transform;
+    /* Кнопка возврата к чтению при просмотре комментариев */
+    #ml-duo-back-to-manga {
+      position: fixed;
+      bottom: 20px;
+      right: 20px;
+      z-index: 9999;
+      padding: 10px 16px;
+      border-radius: 8px;
+      border: 1px solid rgba(128, 128, 128, 0.35);
+      background: #1f1f23;
+      color: #f4f4f5;
+      font-family: inherit;
+      font-size: 14px;
+      font-weight: 500;
+      cursor: pointer;
+      box-shadow: 0 4px 16px rgba(0, 0, 0, 0.32);
     }
 
-    .ml-duo-flipper.turn-l2r {
-      left: 0;
-      transform-origin: right center;
-    }
-
-    .ml-duo-flipper.turn-r2l {
-      left: 50%;
-      transform-origin: left center;
-    }
-
-    .ml-duo-face {
-      position: absolute;
-      inset: 0;
-      display: flex;
-      align-items: center;
-      backface-visibility: hidden;
-      -webkit-backface-visibility: hidden;
-    }
-
-    .ml-duo-flipper.turn-l2r .ml-duo-face.is-front { justify-content: flex-end; }
-    .ml-duo-flipper.turn-l2r .ml-duo-face.is-back  { justify-content: flex-start; transform: rotateY(180deg); }
-    .ml-duo-flipper.turn-r2l .ml-duo-face.is-front { justify-content: flex-start; }
-    .ml-duo-flipper.turn-r2l .ml-duo-face.is-back  { justify-content: flex-end; transform: rotateY(180deg); }
-
-    .ml-duo-shade,
-    .ml-duo-under {
-      position: absolute;
-      inset: 0;
-      pointer-events: none;
-      background: #000;
-      opacity: 0;
-    }
-
-    .ml-duo-under { z-index: 2; }
-
-    /* Блик бумажного края на переворачиваемом листе */
-    .ml-duo-face .ml-duo-sheet {
-      box-shadow: 0 0 28px rgba(0, 0, 0, 0.42);
+    #ml-duo-back-to-manga:hover {
+      background: #2b2b31;
     }
 
     /* --- НАТИВНАЯ СЕКЦИЯ НАСТРОЕК ВНУТРИ ПАНЕЛИ MANGALIB --- */
@@ -646,6 +854,25 @@
       font-weight: 600;
     }
 
+    .ml-duo-action-btn {
+      width: 100%;
+      margin-top: 8px;
+      padding: 7px 10px;
+      border-radius: 6px;
+      border: 1px solid rgba(128, 128, 128, 0.28);
+      background: rgba(128, 128, 128, 0.12);
+      color: inherit;
+      font: inherit;
+      font-size: 13px;
+      font-weight: 500;
+      cursor: pointer;
+      text-align: center;
+    }
+
+    .ml-duo-action-btn:hover {
+      background: rgba(128, 128, 128, 0.22);
+    }
+
     .ml-duo-disabled {
       opacity: 0.42;
       pointer-events: none;
@@ -704,7 +931,7 @@
   }
 
   // =========================================================================
-  // 3. ЧИСТЫЙ ЭКРАН И ПОЛНОЭКРАННЫЙ РЕЖИМ
+  // 3. ЧИСТЫЙ ЭКРАН, ПОЛНОЭКРАННЫЙ РЕЖИМ И ПРОСМОТР КОММЕНТАРИЕВ
   // =========================================================================
 
   function isFullscreen() {
@@ -731,6 +958,7 @@
     for (const el of candidates) {
       if (
         el.id === 'ml-duo-stage' ||
+        el.id === 'ml-duo-back-to-manga' ||
         el.closest('#ml-duo-stage, #ml-duo-fallback-backdrop, [role="dialog"], [class*="modal"], [class*="drawer"], [class*="popup"], [class*="popover"]')
       ) {
         continue;
@@ -753,7 +981,7 @@
 
   function applyCleanScreenState(hidden) {
     uiHidden = Boolean(hidden);
-    if (!isReaderPage() || !settings.enabled) {
+    if (!isReaderPage() || !settings.enabled || commentsOpen) {
       document.documentElement.classList.remove('ml-duo-ui-hidden');
       return;
     }
@@ -765,13 +993,102 @@
     applyCleanScreenState(!uiHidden);
   }
 
+  function findCommentsElement() {
+    const selectors = [
+      '#comments',
+      '[id*="comment"]',
+      '[class*="comments"]',
+      '[data-comments]'
+    ];
+    for (const sel of selectors) {
+      const nodes = document.querySelectorAll(sel);
+      for (const el of nodes) {
+        if (el.closest('#ml-duo-stage, #ml-duo-settings-section, header, nav')) continue;
+        const rect = el.getBoundingClientRect();
+        if (rect.height > 40 || (el.textContent || '').includes('Комментари')) {
+          return el;
+        }
+      }
+    }
+    return null;
+  }
+
+  function openCommentsView(targetRoute = null) {
+    if (!isReaderPage()) return;
+
+    // Закрываем открытые настройки, если открыли комментарии из меню
+    const fallbackModal = document.getElementById('ml-duo-fallback-backdrop');
+    if (fallbackModal) fallbackModal.remove();
+
+    // Если в бесконечной полосе пользователь дошёл до другой главы — переходим на неё, чтобы открыть именно её комментарии
+    const desiredRoute = targetRoute || activeChapterRoute || parseChapterRoute();
+    if (desiredRoute && initialDomRouteKey && desiredRoute.key !== initialDomRouteKey) {
+      try { sessionStorage.setItem(COMMENTS_FLAG_KEY, '1'); } catch (_) {}
+      location.href = buildChapterPathname(desiredRoute);
+      return;
+    }
+
+    commentsOpen = true;
+    document.documentElement.classList.remove('ml-duo-active', 'ml-duo-ui-hidden');
+
+    const stage = document.getElementById('ml-duo-stage');
+    if (stage) stage.style.display = 'none';
+
+    if (hiddenNativeContainer) {
+      hiddenNativeContainer.classList.remove('ml-duo-native-masked');
+      hiddenNativeContainer.classList.add('ml-duo-native-collapsed');
+    }
+
+    // Показываем кнопку возврата к чтению
+    let backBtn = document.getElementById('ml-duo-back-to-manga');
+    if (!backBtn) {
+      backBtn = document.createElement('button');
+      backBtn.id = 'ml-duo-back-to-manga';
+      backBtn.type = 'button';
+      backBtn.textContent = '← Вернуться к чтению';
+      backBtn.addEventListener('click', closeCommentsView);
+      document.body.appendChild(backBtn);
+    }
+
+    // Прокручиваем прямо к комментариям (или пробуем открыть родной блок комментариев MangaLib)
+    requestAnimationFrame(() => {
+      const commentsEl = findCommentsElement();
+      if (commentsEl) {
+        commentsEl.scrollIntoView({ behavior: 'auto', block: 'start' });
+      } else {
+        window.scrollTo(0, document.body.scrollHeight);
+      }
+    });
+  }
+
+  function closeCommentsView() {
+    if (!commentsOpen) return;
+    commentsOpen = false;
+
+    const backBtn = document.getElementById('ml-duo-back-to-manga');
+    if (backBtn) backBtn.remove();
+
+    if (hiddenNativeContainer) {
+      hiddenNativeContainer.classList.remove('ml-duo-native-collapsed');
+      hiddenNativeContainer.classList.add('ml-duo-native-masked');
+    }
+
+    const stage = document.getElementById('ml-duo-stage');
+    if (stage) stage.style.display = '';
+
+    if (isReaderPage() && settings.enabled) {
+      document.documentElement.classList.add('ml-duo-active');
+      applyCleanScreenState(uiHidden);
+    }
+  }
+
   // =========================================================================
-  // 4. ПОИСК КАРТИНОК И РАЗБИЕНИЕ НА РАЗВОРОТЫ
+  // 4. ПОИСК КАРТИНОК, РАЗМЕРЫ КНИГИ И ГРУППИРОВКА РАЗВОРОТОВ
   // =========================================================================
 
   function isLikelyMangaImage(img) {
     if (!img || img.closest('#ml-duo-stage, #ml-duo-settings-section, #ml-duo-fallback-backdrop')) return false;
-    if (img.closest('header, nav, footer, [role="dialog"]')) return false;
+    if (img.closest('header, nav, footer, [role="dialog"], #comments, [class*="comment"]')) return false;
     const src = img.currentSrc || img.src || img.getAttribute('data-src') || '';
     if (!src) return false;
     if (/avatar|logo|icon|emoji|sticker|badge|cover/i.test(src) && !/\/chapters?\//i.test(src)) return false;
@@ -807,6 +1124,10 @@
     const firstAncestors = getAncestors(images[0]);
     for (const candidate of firstAncestors) {
       if (images.every(el => candidate.contains(el))) {
+        // Не скрываем общий контейнер, если внутри него лежат комментарии
+        if (candidate.querySelector('#comments, [class*="comments"]')) {
+          continue;
+        }
         return candidate;
       }
     }
@@ -816,7 +1137,6 @@
   function collectDomPagesFallback(nativeImgs) {
     if (pagesFromApi || nativeImgs.length < 2) return;
     const route = parseChapterRoute();
-    const key = route ? route.key : 'dom';
     const list = nativeImgs
       .map(img => ({
         url: img.currentSrc || img.src || img.getAttribute('data-src') || '',
@@ -826,9 +1146,7 @@
       }))
       .filter(p => isRealFullUrl(p.url));
 
-    if (list.length >= 2) {
-      applyPagesList(list, key, false);
-    }
+    if (list.length >= 2) applyPagesList(list, route, false);
   }
 
   function isWidePage(meta) {
@@ -859,50 +1177,70 @@
         }
       }
     }
-
     if (current.length) groups.push({ pages: current, solo: false });
     return groups;
   }
 
-  function mapGroupToSlots(group) {
+  function mapGroupToSlots(group, pagesArr = chapterPages) {
     if (!group) return { left: null, right: null, solo: null };
-    if (group.solo) {
-      return { left: null, right: null, solo: chapterPages[group.pages[0]] || null };
-    }
-    const p1 = chapterPages[group.pages[0]] || null;
-    const p2 = chapterPages[group.pages[1]] || null;
+    if (group.solo) return { left: null, right: null, solo: pagesArr[group.pages[0]] || null };
+    const p1 = pagesArr[group.pages[0]] || null;
+    const p2 = pagesArr[group.pages[1]] || null;
     return settings.firstPageSide === 'right'
       ? { left: p2, right: p1, solo: null }
       : { left: p1, right: p2, solo: null };
   }
 
-  // =========================================================================
-  // 5. ОТРИСОВКА ЛИСТОВ И ИНТЕРАКТИВНОЕ 3D-ПЕРЕЛИСТЫВАНИЕ (ПАЛЕЦ / МЫШЬ)
-  // =========================================================================
+  function computeBookMetrics(slots) {
+    const vw = window.innerWidth || 1000;
+    const vh = window.innerHeight || 700;
 
-  function createPageSheet(pageMeta, sideClass) {
-    if (!pageMeta) return null;
-    const url = buildImageUrl(pageMeta);
-    if (!url) return null;
+    let ratio = 0.707;
+    const sample = [slots?.right, slots?.left, ...chapterPages.slice(0, 6)]
+      .filter(p => p && p.width > 0 && p.height > 0 && p.width < p.height * 1.15);
 
-    const sheet = document.createElement('div');
-    sheet.className = `ml-duo-sheet ${sideClass}`;
+    if (sample.length) {
+      const ratios = sample.map(p => p.width / p.height);
+      ratio = ratios.reduce((a, b) => a + b, 0) / ratios.length;
+      ratio = Math.max(0.54, Math.min(0.95, ratio));
+    }
 
+    let pageH = vh;
+    let pageW = pageH * ratio;
+    if (pageW * 2 > vw) {
+      pageW = vw / 2;
+      pageH = pageW / ratio;
+    }
+
+    pageW = Math.floor(pageW);
+    pageH = Math.floor(pageH);
+
+    bookMetrics = {
+      pageW,
+      pageH,
+      left: Math.round((vw - pageW * 2) / 2),
+      top: Math.round((vh - pageH) / 2)
+    };
+    return bookMetrics;
+  }
+
+  function createPageImg(pageMeta, onMeasured) {
     const img = document.createElement('img');
     img.referrerPolicy = 'strict-origin-when-cross-origin';
-    img.src = url;
     img.alt = '';
     img.draggable = false;
 
-    // Умный перебор (одинарный слеш + резервные серверы), чтобы никогда не было [?]
+    const primaryUrl = buildImageUrl(pageMeta);
+    img.src = primaryUrl;
+
     const attempts = [];
     const primarySingle = buildImageUrl(pageMeta, '', true);
-    if (primarySingle && primarySingle !== url) attempts.push({ u: primarySingle, s: cdnOrigin });
+    if (primarySingle && primarySingle !== primaryUrl) attempts.push({ u: primarySingle, s: cdnOrigin });
     for (const srv of fallbackServers) {
       const u1 = buildImageUrl(pageMeta, srv, false);
       const u2 = buildImageUrl(pageMeta, srv, true);
-      if (u1 && u1 !== url) attempts.push({ u: u1, s: srv });
-      if (u2 && u2 !== url && u2 !== u1) attempts.push({ u: u2, s: srv });
+      if (u1 && u1 !== primaryUrl) attempts.push({ u: u1, s: srv });
+      if (u2 && u2 !== primaryUrl && u2 !== u1) attempts.push({ u: u2, s: srv });
     }
     let attemptIdx = 0;
 
@@ -915,21 +1253,32 @@
     });
 
     img.addEventListener('load', () => {
-      if (img.dataset.mlTryServer) {
-        cdnOrigin = img.dataset.mlTryServer;
-      }
+      if (img.dataset.mlTryServer) cdnOrigin = img.dataset.mlTryServer;
       if (!pageMeta.width || !pageMeta.height) {
-        const wasWide = isWidePage(pageMeta);
         pageMeta.width = img.naturalWidth;
         pageMeta.height = img.naturalHeight;
-        if (settings.autoWide && !wasWide && isWidePage(pageMeta) && !drag.isDragging) {
-          renderStaticCurrentSpread();
-        }
+        if (onMeasured) onMeasured(pageMeta);
       }
     }, { once: true });
 
-    sheet.appendChild(img);
-    return sheet;
+    return img;
+  }
+
+  function createPageBox(pageMeta, boxClass, w, h) {
+    const box = document.createElement('div');
+    box.className = `ml-duo-page-box ${boxClass}`;
+    box.style.width = `${w}px`;
+    box.style.height = `${h}px`;
+
+    if (pageMeta) {
+      const img = createPageImg(pageMeta, () => {
+        if (settings.readingMode === 'paged' && !curl.isDragging && !curl.isAnimating) {
+          renderStaticCurrentSpread();
+        }
+      });
+      box.appendChild(img);
+    }
+    return box;
   }
 
   function preloadSpread(groups, idx) {
@@ -952,198 +1301,276 @@
     }
   }
 
-  function renderStaticSpreadInto(spreadEl, slots) {
-    spreadEl.style.transition = '';
-    spreadEl.style.transform = '';
-    spreadEl.innerHTML = '';
+  // =========================================================================
+  // 5. РЕЖИМ 1: ПОСТРАНИЧНЫЙ РАЗВОРОТ (ЧИСТАЯ КНИЖНАЯ СТРАНИЦА / БЕЗ АНИМАЦИИ)
+  // =========================================================================
 
-    if (slots.solo) {
-      const wrap = document.createElement('div');
-      wrap.className = 'ml-duo-solo-slot';
-      const sheet = createPageSheet(slots.solo, 'is-solo-page');
-      if (sheet) wrap.appendChild(sheet);
-      spreadEl.appendChild(wrap);
-      return;
+  function clipPolyHalfPlane(poly, mx, my, nx, ny) {
+    if (!poly.length) return [];
+    const out = [];
+    for (let i = 0; i < poly.length; i++) {
+      const a = poly[i];
+      const b = poly[(i + 1) % poly.length];
+      const da = (a.x - mx) * nx + (a.y - my) * ny;
+      const db = (b.x - mx) * nx + (b.y - my) * ny;
+      if (da >= 0) out.push(a);
+      if ((da >= 0) !== (db >= 0)) {
+        const t = da / (da - db);
+        out.push({ x: a.x + (b.x - a.x) * t, y: a.y + (b.y - a.y) * t });
+      }
     }
+    return out;
+  }
 
-    const leftSlot = document.createElement('div');
-    leftSlot.className = 'ml-duo-slot is-left';
-    const leftSheet = createPageSheet(slots.left, 'is-left-page');
-    if (leftSheet) leftSlot.appendChild(leftSheet);
+  function reflectPoint(p, mx, my, nx, ny) {
+    const d = (p.x - mx) * nx + (p.y - my) * ny;
+    return { x: p.x - 2 * d * nx, y: p.y - 2 * d * ny };
+  }
 
-    const rightSlot = document.createElement('div');
-    rightSlot.className = 'ml-duo-slot is-right';
-    const rightSheet = createPageSheet(slots.right, 'is-right-page');
-    if (rightSheet) rightSlot.appendChild(rightSheet);
+  function clampToCircle(x, y, cx, cy, r) {
+    const dx = x - cx;
+    const dy = y - cy;
+    const dist = Math.hypot(dx, dy);
+    if (dist <= r || dist < 1e-6) return { x, y };
+    const s = r / dist;
+    return { x: cx + dx * s, y: cy + dy * s };
+  }
 
-    spreadEl.appendChild(leftSlot);
-    spreadEl.appendChild(rightSlot);
+  function polyToClipPath(poly) {
+    if (!poly || poly.length < 3) return 'polygon(0px 0px, 0px 0px, 0px 0px)';
+    return 'polygon(' + poly.map(p => `${p.x.toFixed(1)}px ${p.y.toFixed(1)}px`).join(', ') + ')';
   }
 
   function renderStaticCurrentSpread() {
     const stage = document.getElementById('ml-duo-stage');
-    if (!stage || !chapterPages.length) return;
+    if (!stage || !chapterPages.length || settings.readingMode !== 'paged') return;
+
     const groups = computeSpreadGroups(chapterPages);
     if (!groups.length) return;
 
     currentSpreadIndex = Math.max(0, Math.min(currentSpreadIndex, groups.length - 1));
-    stage.classList.toggle('ml-book-fx', settings.flipAnimation);
-
-    const spreadEl = stage.querySelector('.ml-duo-spread');
     const group = groups[currentSpreadIndex];
-    renderStaticSpreadInto(spreadEl, mapGroupToSlots(group));
+    const slots = mapGroupToSlots(group);
 
-    // Обновляем параметр ?p= в адресной строке
-    try {
-      const firstPageNum = group.pages[0] + 1;
-      const u = new URL(location.href);
-      if (u.searchParams.get('p') !== String(firstPageNum)) {
-        u.searchParams.set('p', String(firstPageNum));
-        window.history.replaceState(window.history.state, '', u.toString());
-        currentUrl = u.toString();
-      }
-    } catch (_) {}
+    stage.classList.toggle('can-grab', settings.pageCurl);
+    stage.innerHTML = '';
 
+    if (slots.solo) {
+      const soloWrap = document.createElement('div');
+      soloWrap.className = 'ml-duo-solo-wrap';
+      soloWrap.appendChild(createPageImg(slots.solo, () => {
+        if (!curl.isDragging && !curl.isAnimating) renderStaticCurrentSpread();
+      }));
+      stage.appendChild(soloWrap);
+    } else {
+      const m = computeBookMetrics(slots);
+      const book = document.createElement('div');
+      book.className = 'ml-duo-book';
+      book.style.width = `${m.pageW * 2}px`;
+      book.style.height = `${m.pageH}px`;
+
+      book.appendChild(createPageBox(slots.left, 'is-left', m.pageW, m.pageH));
+      book.appendChild(createPageBox(slots.right, 'is-right', m.pageW, m.pageH));
+      stage.appendChild(book);
+    }
+
+    syncPageQueryParam(group.pages[0] + 1);
     preloadSpread(groups, currentSpreadIndex + 1);
     preloadSpread(groups, currentSpreadIndex + 2);
     preloadSpread(groups, currentSpreadIndex - 1);
   }
 
-  // Строит сцену для живого 3D-перелистывания (управляемого прогрессом p от 0 до 1)
-  function buildInteractiveFlipDOM(spreadEl, oldSlots, newSlots, turnDir) {
-    spreadEl.style.transition = '';
-    spreadEl.style.transform = '';
-    spreadEl.innerHTML = '';
+  function syncPageQueryParam(pageNum, routeOverride = null) {
+    try {
+      const u = new URL(location.href);
+      if (routeOverride) {
+        u.pathname = buildChapterPathname(routeOverride);
+      }
+      u.searchParams.set('p', String(pageNum));
+      const nextHref = u.toString();
+      if (nextHref !== location.href) {
+        window.history.replaceState(window.history.state, '', nextHref);
+        currentUrl = nextHref;
+      }
+    } catch (_) {}
+  }
 
-    // 1. Левая базовая страница (под листом)
-    const leftSlot = document.createElement('div');
-    leftSlot.className = 'ml-duo-slot is-left';
-    const baseLeftSheet = createPageSheet(turnDir === 'l2r' ? newSlots.left : oldSlots.left, 'is-left-page');
-    let leftUnder = null;
-    if (baseLeftSheet) {
-      leftUnder = document.createElement('div');
-      leftUnder.className = 'ml-duo-under';
-      baseLeftSheet.appendChild(leftUnder);
-      leftSlot.appendChild(baseLeftSheet);
-    }
+  // Чистая сцена книжной страницы (без теней, градиентов и 3D-эффектов)
+  function buildCleanCurlDOM(oldSlots, newSlots, turnDir) {
+    const stage = document.getElementById('ml-duo-stage');
+    if (!stage) return null;
 
-    // 2. Правая базовая страница (под листом)
-    const rightSlot = document.createElement('div');
-    rightSlot.className = 'ml-duo-slot is-right';
-    const baseRightSheet = createPageSheet(turnDir === 'l2r' ? oldSlots.right : newSlots.right, 'is-right-page');
-    let rightUnder = null;
-    if (baseRightSheet) {
-      rightUnder = document.createElement('div');
-      rightUnder.className = 'ml-duo-under';
-      baseRightSheet.appendChild(rightUnder);
-      rightSlot.appendChild(baseRightSheet);
-    }
+    const m = computeBookMetrics(oldSlots);
+    const w = m.pageW;
+    const h = m.pageH;
 
-    // 3. Переворачиваемый 3D-лист (лицевая + оборотная стороны)
-    const flipper = document.createElement('div');
-    flipper.className = `ml-duo-flipper ${turnDir === 'l2r' ? 'turn-l2r' : 'turn-r2l'}`;
+    stage.innerHTML = '';
 
-    const frontFace = document.createElement('div');
-    frontFace.className = 'ml-duo-face is-front';
-    const frontSheet = createPageSheet(
+    const book = document.createElement('div');
+    book.className = 'ml-duo-book';
+    book.style.width = `${w * 2}px`;
+    book.style.height = `${h}px`;
+
+    // 1. Нижний слой (открывающаяся + неподвижная страницы)
+    const underLayer = document.createElement('div');
+    underLayer.className = 'ml-duo-layer';
+    underLayer.appendChild(createPageBox(turnDir === 'l2r' ? newSlots.left : oldSlots.left, 'is-left', w, h));
+    underLayer.appendChild(createPageBox(turnDir === 'l2r' ? oldSlots.right : newSlots.right, 'is-right', w, h));
+
+    // 2. Лицевая часть перелистываемой страницы
+    const frontLayer = document.createElement('div');
+    frontLayer.className = 'ml-duo-layer ml-curl-front';
+    frontLayer.appendChild(createPageBox(
       turnDir === 'l2r' ? oldSlots.left : oldSlots.right,
-      turnDir === 'l2r' ? 'is-left-page' : 'is-right-page'
-    );
-    let frontShade = null;
-    if (frontSheet) {
-      frontShade = document.createElement('div');
-      frontShade.className = 'ml-duo-shade';
-      frontSheet.appendChild(frontShade);
-      frontFace.appendChild(frontSheet);
-    }
+      turnDir === 'l2r' ? 'is-left' : 'is-right',
+      w,
+      h
+    ));
 
-    const backFace = document.createElement('div');
-    backFace.className = 'ml-duo-face is-back';
-    const backSheet = createPageSheet(
+    // 3. Переворачиваемый чистый лист (оборотная сторона)
+    const flapLayer = document.createElement('div');
+    flapLayer.className = 'ml-duo-layer ml-curl-flap';
+
+    const backBox = createPageBox(
       turnDir === 'l2r' ? newSlots.right : newSlots.left,
-      turnDir === 'l2r' ? 'is-right-page' : 'is-left-page'
+      `is-back ${turnDir === 'l2r' ? 'is-right' : 'is-left'}`,
+      w,
+      h
     );
-    let backShade = null;
-    if (backSheet) {
-      backShade = document.createElement('div');
-      backShade.className = 'ml-duo-shade';
-      backSheet.appendChild(backShade);
-      backFace.appendChild(backSheet);
-    }
+    flapLayer.appendChild(backBox);
 
-    flipper.appendChild(frontFace);
-    flipper.appendChild(backFace);
+    book.appendChild(underLayer);
+    book.appendChild(frontLayer);
+    book.appendChild(flapLayer);
+    stage.appendChild(book);
 
-    spreadEl.appendChild(leftSlot);
-    spreadEl.appendChild(rightSlot);
-    spreadEl.appendChild(flipper);
-
-    return { spreadEl, flipper, frontShade, backShade, leftUnder, rightUnder, turnDir };
+    return { w, h, turnDir, frontLayer, flapLayer, backBox };
   }
 
-  // Применяет угол поворота и тени для конкретного прогресса p (0..1)
-  function setFlipProgress(nodes, p, withTransitionMs = 0) {
+  function updateCleanCurlGeometry(nodes, bxRaw, dyRaw) {
     if (!nodes) return;
-    const clamped = Math.max(0, Math.min(1, p));
-    const angle = nodes.turnDir === 'l2r' ? clamped * 180 : -clamped * 180;
-    const tr = withTransitionMs > 0 ? `transform ${withTransitionMs}ms cubic-bezier(0.22, 1, 0.36, 1)` : 'none';
-    const opTr = withTransitionMs > 0 ? `opacity ${withTransitionMs}ms ease` : 'none';
+    const { w, h, turnDir, frontLayer, flapLayer, backBox } = nodes;
+    const diag = Math.hypot(w, h);
+    const totalW = w * 2;
 
-    nodes.flipper.style.transition = tr;
-    nodes.flipper.style.transform = `rotateY(${angle.toFixed(2)}deg)`;
+    let A, B;
+    if (turnDir === 'l2r') {
+      const bx = Math.max(0.5, Math.min(totalW - 0.1, bxRaw));
+      if (dyRaw <= 0) {
+        A = { x: 0, y: h };
+        B = { x: bx, y: h + dyRaw };
+        B = clampToCircle(B.x, B.y, w, 0, diag - 0.5);
+        B = clampToCircle(B.x, B.y, w, h, w - 0.1);
+      } else {
+        A = { x: 0, y: 0 };
+        B = { x: bx, y: dyRaw };
+        B = clampToCircle(B.x, B.y, w, h, diag - 0.5);
+        B = clampToCircle(B.x, B.y, w, 0, w - 0.1);
+      }
+      if (B.x < 0.5) B.x = 0.5;
+    } else {
+      const bx = Math.max(0.1, Math.min(totalW - 0.5, bxRaw));
+      if (dyRaw <= 0) {
+        A = { x: totalW, y: h };
+        B = { x: bx, y: h + dyRaw };
+        B = clampToCircle(B.x, B.y, w, 0, diag - 0.5);
+        B = clampToCircle(B.x, B.y, w, h, w - 0.1);
+      } else {
+        A = { x: totalW, y: 0 };
+        B = { x: bx, y: dyRaw };
+        B = clampToCircle(B.x, B.y, w, h, diag - 0.5);
+        B = clampToCircle(B.x, B.y, w, 0, w - 0.1);
+      }
+      if (B.x > totalW - 0.5) B.x = totalW - 0.5;
+    }
 
-    const midShade = Math.sin(clamped * Math.PI) * 0.42;
-    if (nodes.frontShade) {
-      nodes.frontShade.style.transition = opTr;
-      nodes.frontShade.style.opacity = String(Math.min(0.55, midShade + clamped * 0.12).toFixed(3));
-    }
-    if (nodes.backShade) {
-      nodes.backShade.style.transition = opTr;
-      nodes.backShade.style.opacity = String(Math.min(0.55, midShade + (1 - clamped) * 0.12).toFixed(3));
-    }
+    const vx = B.x - A.x;
+    const vy = B.y - A.y;
+    const len = Math.hypot(vx, vy);
+    if (len < 0.5) return;
 
-    const revealOpacity = (1 - clamped) * 0.45;
-    const coverOpacity = clamped * 0.45;
-    if (nodes.leftUnder) {
-      nodes.leftUnder.style.transition = opTr;
-      nodes.leftUnder.style.opacity = String((nodes.turnDir === 'l2r' ? revealOpacity : coverOpacity).toFixed(3));
-    }
-    if (nodes.rightUnder) {
-      nodes.rightUnder.style.transition = opTr;
-      nodes.rightUnder.style.opacity = String((nodes.turnDir === 'l2r' ? coverOpacity : revealOpacity).toFixed(3));
-    }
+    const nx = vx / len;
+    const ny = vy / len;
+    const mx = (A.x + B.x) * 0.5;
+    const my = (A.y + B.y) * 0.5;
+    const alpha = Math.atan2(ny, nx);
+
+    const pageRect = turnDir === 'l2r'
+      ? [{ x: 0, y: 0 }, { x: w, y: 0 }, { x: w, y: h }, { x: 0, y: h }]
+      : [{ x: w, y: 0 }, { x: totalW, y: 0 }, { x: totalW, y: h }, { x: w, y: h }];
+
+    const flatPoly = clipPolyHalfPlane(pageRect, mx, my, nx, ny);
+    const peeledPoly = clipPolyHalfPlane(pageRect, mx, my, -nx, -ny);
+    const flapPoly = peeledPoly.map(p => reflectPoint(p, mx, my, nx, ny));
+
+    frontLayer.style.clipPath = polyToClipPath(flatPoly);
+    flapLayer.style.clipPath = polyToClipPath(flapPoly);
+
+    const originStart = turnDir === 'l2r' ? { x: w, y: 0 } : { x: totalW, y: 0 };
+    const O = reflectPoint(originStart, mx, my, nx, ny);
+    backBox.style.transform = `translate3d(${O.x.toFixed(2)}px, ${O.y.toFixed(2)}px, 0) rotate(${(2 * alpha).toFixed(5)}rad)`;
   }
 
-  // Анимация полного переворота по клику или клавише (0 -> 1)
-  function animateTurnToSpread(delta) {
+  function stopCurlAnimation() {
+    if (animRaf) {
+      cancelAnimationFrame(animRaf);
+      animRaf = null;
+    }
+    curl.isAnimating = false;
+  }
+
+  function animateCurlTo(nodes, fromBx, fromDy, toBx, toDy, durationMs, arcHeight, onDone) {
+    stopCurlAnimation();
+    curl.isAnimating = true;
+    const startTime = performance.now();
+
+    const step = (now) => {
+      const rawT = Math.min(1, (now - startTime) / durationMs);
+      const ease = 1 - Math.pow(1 - rawT, 3.2);
+
+      const bx = fromBx + (toBx - fromBx) * ease;
+      const dy = fromDy * (1 - ease) + arcHeight * Math.sin(rawT * Math.PI);
+
+      curl.bx = bx;
+      curl.dy = dy;
+      updateCleanCurlGeometry(nodes, bx, dy);
+
+      if (rawT < 1) {
+        animRaf = requestAnimationFrame(step);
+      } else {
+        animRaf = null;
+        curl.isAnimating = false;
+        onDone();
+      }
+    };
+
+    animRaf = requestAnimationFrame(step);
+  }
+
+  function triggerPagedTurn(delta) {
     if (!chapterPages.length) {
-      loadChapterFromApi();
+      loadCurrentChapterFromApi();
       return;
     }
 
     const groups = computeSpreadGroups(chapterPages);
     if (!groups.length) return;
 
-    if (isAnimatingFinish) {
-      clearTimeout(animTimer);
-      isAnimatingFinish = false;
+    if (curl.isAnimating) {
+      stopCurlAnimation();
       renderStaticCurrentSpread();
     }
 
     const nextIdx = currentSpreadIndex + delta;
     if (nextIdx >= groups.length || nextIdx < 0) {
       if (!pagesFromApi && chapterPages.length < 2) {
-        loadChapterFromApi();
+        loadCurrentChapterFromApi();
         return;
       }
-      if (Date.now() - lastSpreadChangeAt < 300) return;
+      if (Date.now() - lastSpreadChangeAt < 280) return;
       goToAdjacentChapter(nextIdx >= groups.length ? 1 : -1);
       return;
     }
-
-    const stage = document.getElementById('ml-duo-stage');
-    if (!stage) return;
-    const spreadEl = stage.querySelector('.ml-duo-spread');
 
     const oldGroup = groups[currentSpreadIndex];
     const newGroup = groups[nextIdx];
@@ -1154,164 +1581,158 @@
     currentSpreadIndex = nextIdx;
     lastSpreadChangeAt = Date.now();
 
-    if (settings.flipAnimation && !oldGroup.solo && !newGroup.solo) {
-      const nodes = buildInteractiveFlipDOM(
-        spreadEl,
-        mapGroupToSlots(oldGroup),
-        mapGroupToSlots(newGroup),
-        turnDir
-      );
-      setFlipProgress(nodes, 0, 0);
-      // Принудительный reflow перед запуском плавного переворота
-      void nodes.flipper.offsetWidth;
-      isAnimatingFinish = true;
-      setFlipProgress(nodes, 1, 380);
-      animTimer = setTimeout(() => {
-        isAnimatingFinish = false;
-        renderStaticCurrentSpread();
-      }, 395);
-    } else {
-      // Мягкий боковой сдвиг для одиночных широких сканов или при выключенном 3D
+    // Если анимация отключена (или одиночный широкий скан) — мгновенное переключение БЕЗ анимации
+    if (!settings.pageCurl || oldGroup.solo || newGroup.solo) {
       renderStaticCurrentSpread();
-      spreadEl.style.transition = 'none';
-      spreadEl.style.transform = `translateX(${turnDir === 'l2r' ? '-36px' : '36px'})`;
-      void spreadEl.offsetWidth;
-      spreadEl.style.transition = 'transform 200ms cubic-bezier(0.22, 1, 0.36, 1)';
-      spreadEl.style.transform = 'translateX(0)';
+      return;
     }
+
+    const nodes = buildCleanCurlDOM(mapGroupToSlots(oldGroup), mapGroupToSlots(newGroup), turnDir);
+    if (!nodes) {
+      renderStaticCurrentSpread();
+      return;
+    }
+
+    const totalW = nodes.w * 2;
+    const startBx = turnDir === 'l2r' ? 1 : totalW - 1;
+    const endBx = turnDir === 'l2r' ? totalW - 0.5 : 0.5;
+    const arc = -Math.min(nodes.h * 0.12, 100);
+
+    animateCurlTo(nodes, startBx, 0, endBx, 0, 390, arc, () => {
+      renderStaticCurrentSpread();
+    });
   }
 
-  // --- Интерактивное управление жестом перелистывания (Pointer Events) ---
-  function onStagePointerDown(e) {
+  // Интерактивный жест в постраничном режиме (мышь + палец)
+  function onPagedPointerDown(e) {
     if (isAnyModalOpen()) return;
     if (e.pointerType === 'mouse' && e.button !== 0) return;
-    if (drag.active) return;
+    if (curl.active) return;
 
     e.stopPropagation();
 
-    if (isAnimatingFinish) {
-      clearTimeout(animTimer);
-      isAnimatingFinish = false;
+    if (curl.isAnimating) {
+      stopCurlAnimation();
       renderStaticCurrentSpread();
     }
 
-    const vw = window.innerWidth || 1;
-    drag.active = true;
-    drag.pointerId = e.pointerId;
-    drag.isDragging = false;
-    drag.startX = e.clientX;
-    drag.startY = e.clientY;
-    drag.lastX = e.clientX;
-    drag.lastTime = performance.now();
-    drag.vx = 0;
-    drag.progress = 0;
-    drag.nodes = null;
-    drag.side = e.clientX < vw * 0.5 ? 'left' : 'right';
+    curl.active = true;
+    curl.pointerId = e.pointerId;
+    curl.isDragging = false;
+    curl.canCurl = false;
+    curl.startX = e.clientX;
+    curl.startY = e.clientY;
+    curl.startBookX = e.clientX - bookMetrics.left;
+    curl.startBookY = e.clientY - bookMetrics.top;
+    curl.lastX = e.clientX;
+    curl.lastTime = performance.now();
+    curl.vx = 0;
+    curl.progress = 0;
+    curl.nodes = null;
 
-    window.addEventListener('pointermove', onWindowPointerMove, { passive: false });
-    window.addEventListener('pointerup', onWindowPointerUp);
-    window.addEventListener('pointercancel', onWindowPointerCancel);
+    window.addEventListener('pointermove', onPagedPointerMove, { passive: false });
+    window.addEventListener('pointerup', onPagedPointerUp);
+    window.addEventListener('pointercancel', onPagedPointerCancel);
   }
 
-  function startInteractiveDrag(dx) {
+  function startPagedDrag(dx) {
     const groups = computeSpreadGroups(chapterPages);
     if (!groups.length) return false;
 
     const stage = document.getElementById('ml-duo-stage');
     if (!stage) return false;
-    const spreadEl = stage.querySelector('.ml-duo-spread');
 
-    // Направление физического движения пальца/мыши:
-    // Тянем вправо (dx > 0) -> перекидываем ЛЕВЫЙ лист направо (l2r)
-    // Тянем влево (dx < 0)  -> перекидываем ПРАВЫЙ лист налево (r2l)
-    drag.turnDir = dx > 0 ? 'l2r' : 'r2l';
+    curl.turnDir = dx > 0 ? 'l2r' : 'r2l';
+    curl.stepDelta = settings.rtlNav
+      ? (curl.turnDir === 'l2r' ? 1 : -1)
+      : (curl.turnDir === 'r2l' ? 1 : -1);
 
-    // Какой это шаг по страницам в зависимости от направления чтения (манга RTL или комикс LTR)
-    if (settings.rtlNav) {
-      drag.stepDelta = drag.turnDir === 'l2r' ? 1 : -1;
-    } else {
-      drag.stepDelta = drag.turnDir === 'r2l' ? 1 : -1;
-    }
-
-    drag.targetIndex = currentSpreadIndex + drag.stepDelta;
-    drag.isBoundary = drag.targetIndex < 0 || drag.targetIndex >= groups.length;
+    curl.targetIndex = currentSpreadIndex + curl.stepDelta;
+    curl.isBoundary = curl.targetIndex < 0 || curl.targetIndex >= groups.length;
 
     const oldGroup = groups[currentSpreadIndex];
-    const newGroup = !drag.isBoundary ? groups[drag.targetIndex] : null;
+    const newGroup = !curl.isBoundary ? groups[curl.targetIndex] : null;
+    curl.canCurl = settings.pageCurl && !curl.isBoundary && !oldGroup.solo && newGroup && !newGroup.solo;
+    curl.isDragging = true;
 
-    drag.is3D = settings.flipAnimation && !drag.isBoundary && !oldGroup.solo && newGroup && !newGroup.solo;
-    drag.isDragging = true;
-    stage.classList.add('is-dragging');
-
-    if (drag.is3D) {
-      drag.nodes = buildInteractiveFlipDOM(
-        spreadEl,
-        mapGroupToSlots(oldGroup),
-        mapGroupToSlots(newGroup),
-        drag.turnDir
-      );
-      setFlipProgress(drag.nodes, 0, 0);
-    } else {
-      drag.nodes = { spreadEl };
+    if (curl.canCurl) {
+      stage.classList.add('is-dragging');
+      const nodes = buildCleanCurlDOM(mapGroupToSlots(oldGroup), mapGroupToSlots(newGroup), curl.turnDir);
+      if (!nodes) return false;
+      curl.nodes = nodes;
+      curl.bx = curl.turnDir === 'l2r' ? 1 : nodes.w * 2 - 1;
+      curl.dy = 0;
     }
     return true;
   }
 
-  function onWindowPointerMove(e) {
-    if (!drag.active || e.pointerId !== drag.pointerId) return;
+  function onPagedPointerMove(e) {
+    if (!curl.active || e.pointerId !== curl.pointerId) return;
 
-    const dx = e.clientX - drag.startX;
-    const dy = e.clientY - drag.startY;
+    const dx = e.clientX - curl.startX;
+    const dy = e.clientY - curl.startY;
     const now = performance.now();
-    const dt = Math.max(1, now - drag.lastTime);
-    drag.vx = (e.clientX - drag.lastX) / dt;
-    drag.lastX = e.clientX;
-    drag.lastTime = now;
+    const dt = Math.max(1, now - curl.lastTime);
+    curl.vx = (e.clientX - curl.lastX) / dt;
+    curl.lastX = e.clientX;
+    curl.lastTime = now;
 
-    if (!drag.isDragging) {
-      if (Math.hypot(dx, dy) < 8) return;
-      if (Math.abs(dy) > Math.abs(dx) * 1.4) {
-        cleanupDragListeners();
-        drag.active = false;
+    if (!curl.isDragging) {
+      if (Math.hypot(dx, dy) < 7) return;
+      if (Math.abs(dy) > Math.abs(dx) * 1.55) {
+        cleanupPagedDragListeners();
+        curl.active = false;
         return;
       }
-      if (!startInteractiveDrag(dx)) {
-        cleanupDragListeners();
-        drag.active = false;
+      if (!startPagedDrag(dx)) {
+        cleanupPagedDragListeners();
+        curl.active = false;
         return;
       }
     }
 
     e.preventDefault();
 
-    const vw = window.innerWidth || 1;
-    // Дистанция полного переворота ~60% ширины экрана — удобно и на большом мониторе, и на планшете
-    const signedDx = drag.turnDir === 'l2r' ? dx : -dx;
-    const rawProgress = Math.max(0, Math.min(1, signedDx / (vw * 0.6)));
-    drag.progress = rawProgress;
+    if (curl.canCurl && curl.nodes) {
+      const w = curl.nodes.w;
+      const h = curl.nodes.h;
+      const totalW = w * 2;
 
-    if (drag.is3D && drag.nodes) {
-      setFlipProgress(drag.nodes, rawProgress, 0);
-    } else if (drag.nodes?.spreadEl) {
-      const resist = drag.isBoundary ? 0.25 : 0.65;
-      drag.nodes.spreadEl.style.transition = 'none';
-      drag.nodes.spreadEl.style.transform = `translateX(${(dx * resist).toFixed(1)}px)`;
+      if (curl.turnDir === 'l2r') {
+        const startXClamped = Math.max(0, Math.min(w * 1.15, curl.startBookX));
+        const span = Math.max(w * 0.75, totalW - startXClamped);
+        curl.progress = Math.max(0, Math.min(1, dx / span));
+        curl.bx = Math.max(1, curl.progress * totalW);
+      } else {
+        const startXClamped = Math.max(w * 0.85, Math.min(totalW, curl.startBookX));
+        const span = Math.max(w * 0.75, startXClamped);
+        curl.progress = Math.max(0, Math.min(1, -dx / span));
+        curl.bx = Math.min(totalW - 1, totalW - curl.progress * totalW);
+      }
+
+      const damp = Math.sin(curl.progress * Math.PI);
+      const naturalBias = (curl.startBookY < h * 0.42 ? 1 : -1) * Math.min(24, h * 0.038) * damp;
+      curl.dy = dy * 0.8 * Math.max(0.15, 1 - Math.pow(curl.progress, 2.2)) + naturalBias;
+
+      updateCleanCurlGeometry(curl.nodes, curl.bx, curl.dy);
+    } else {
+      // Без анимации — только фиксируем прогресс свайпа, саму картинку не двигаем
+      curl.progress = Math.min(1, Math.abs(dx) / 90);
     }
   }
 
-  function finishInteractiveDrag(cancelled = false) {
+  function finishPagedDrag(cancelled = false) {
     const stage = document.getElementById('ml-duo-stage');
     if (stage) stage.classList.remove('is-dragging');
 
-    // Если палец/мышь почти не двигались — обрабатываем как обычный клик/тап
-    if (!drag.isDragging) {
+    if (!curl.isDragging) {
       if (!cancelled) {
         const vw = window.innerWidth || 1;
-        const ratio = drag.startX / vw;
+        const ratio = curl.startX / vw;
         if (ratio < 0.35) {
-          animateTurnToSpread(settings.rtlNav ? 1 : -1);
+          triggerPagedTurn(settings.rtlNav ? 1 : -1);
         } else if (ratio > 0.65) {
-          animateTurnToSpread(settings.rtlNav ? -1 : 1);
+          triggerPagedTurn(settings.rtlNav ? -1 : 1);
         } else {
           toggleReaderChrome();
         }
@@ -1319,127 +1740,461 @@
       return;
     }
 
-    // Проверяем, дотянул ли пользователь страницу или сделал быстрый смах
-    const directedVel = drag.turnDir === 'l2r' ? drag.vx : -drag.vx;
+    const directedVel = curl.turnDir === 'l2r' ? curl.vx : -curl.vx;
     const shouldCommit = !cancelled && (
-      drag.progress > 0.28 ||
-      (directedVel > 0.35 && drag.progress > 0.06)
+      curl.progress > 0.32 ||
+      (directedVel > 0.32 && curl.progress > 0.06)
     );
 
-    if (drag.isBoundary) {
-      // Возвращаем сдвиг и при уверенном жесте переходим на соседнюю главу
-      if (drag.nodes?.spreadEl) {
-        drag.nodes.spreadEl.style.transition = 'transform 180ms ease';
-        drag.nodes.spreadEl.style.transform = 'translateX(0)';
-      }
+    if (curl.isBoundary) {
       if (shouldCommit && (pagesFromApi || chapterPages.length >= 2)) {
-        goToAdjacentChapter(drag.stepDelta);
+        goToAdjacentChapter(curl.stepDelta);
       }
       return;
     }
 
-    if (drag.is3D && drag.nodes) {
-      const nodes = drag.nodes;
-      const targetP = shouldCommit ? 1 : 0;
-      const dist = Math.abs(targetP - drag.progress);
-      const duration = Math.max(120, Math.min(340, Math.round(dist * 360)));
+    if (curl.canCurl && curl.nodes) {
+      const nodes = curl.nodes;
+      const totalW = nodes.w * 2;
+      const toBx = shouldCommit
+        ? (curl.turnDir === 'l2r' ? totalW - 0.5 : 0.5)
+        : (curl.turnDir === 'l2r' ? 0.5 : totalW - 0.5);
+
+      const remaining = Math.abs(toBx - curl.bx) / totalW;
+      const duration = Math.max(130, Math.min(340, Math.round(remaining * 400)));
 
       if (shouldCommit) {
-        currentSpreadIndex = drag.targetIndex;
+        currentSpreadIndex = curl.targetIndex;
         lastSpreadChangeAt = Date.now();
       }
 
-      isAnimatingFinish = true;
-      setFlipProgress(nodes, targetP, duration);
-      animTimer = setTimeout(() => {
-        isAnimatingFinish = false;
+      animateCurlTo(nodes, curl.bx, curl.dy, toBx, 0, duration, 0, () => {
         renderStaticCurrentSpread();
-      }, duration + 20);
+      });
       return;
     }
 
-    // Горизонтальный сдвиг (для одиночных/широких сканов или при выключенном 3D)
-    const spreadEl = drag.nodes?.spreadEl;
+    // Без анимации: мгновенный переход при свайпе
     if (shouldCommit) {
-      currentSpreadIndex = drag.targetIndex;
+      currentSpreadIndex = curl.targetIndex;
       lastSpreadChangeAt = Date.now();
-      if (spreadEl) {
-        const exitX = drag.turnDir === 'l2r' ? '140px' : '-140px';
-        spreadEl.style.transition = 'transform 140ms ease-in';
-        spreadEl.style.transform = `translateX(${exitX})`;
-        isAnimatingFinish = true;
-        animTimer = setTimeout(() => {
-          isAnimatingFinish = false;
-          renderStaticCurrentSpread();
-        }, 145);
-      } else {
-        renderStaticCurrentSpread();
-      }
-    } else if (spreadEl) {
-      spreadEl.style.transition = 'transform 180ms ease';
-      spreadEl.style.transform = 'translateX(0)';
+      renderStaticCurrentSpread();
     }
   }
 
-  function cleanupDragListeners() {
-    window.removeEventListener('pointermove', onWindowPointerMove);
-    window.removeEventListener('pointerup', onWindowPointerUp);
-    window.removeEventListener('pointercancel', onWindowPointerCancel);
+  function cleanupPagedDragListeners() {
+    window.removeEventListener('pointermove', onPagedPointerMove);
+    window.removeEventListener('pointerup', onPagedPointerUp);
+    window.removeEventListener('pointercancel', onPagedPointerCancel);
   }
 
-  function onWindowPointerUp(e) {
-    if (!drag.active || e.pointerId !== drag.pointerId) return;
-    cleanupDragListeners();
-    drag.active = false;
-    finishInteractiveDrag(false);
+  function onPagedPointerUp(e) {
+    if (!curl.active || e.pointerId !== curl.pointerId) return;
+    cleanupPagedDragListeners();
+    curl.active = false;
+    finishPagedDrag(false);
   }
 
-  function onWindowPointerCancel(e) {
-    if (!drag.active || e.pointerId !== drag.pointerId) return;
-    cleanupDragListeners();
-    drag.active = false;
-    finishInteractiveDrag(true);
+  function onPagedPointerCancel(e) {
+    if (!curl.active || e.pointerId !== curl.pointerId) return;
+    cleanupPagedDragListeners();
+    curl.active = false;
+    finishPagedDrag(true);
   }
+
+  // =========================================================================
+  // 6. РЕЖИМ 2: БЕСКОНЕЧНАЯ ГОРИЗОНТАЛЬНАЯ ПОЛОСА (ПО 2 СТРАНИЦЫ ВБОК)
+  // =========================================================================
+
+  function resetStripState() {
+    stripState.loadedKeys.clear();
+    stripState.chaptersData.clear();
+    stripState.lastLoadedRoute = null;
+    stripState.loadingNext = false;
+    stripState.noMoreChapters = false;
+    stripState.userScrolled = false;
+    clearTimeout(stripState.scrollTimer);
+  }
+
+  function buildStripChapterNodes(route, pages, includeStartDivider = false) {
+    const groups = computeSpreadGroups(pages);
+    const orderedGroups = settings.rtlNav ? [...groups].reverse() : groups;
+    const fragment = document.createDocumentFragment();
+
+    const makeSpreadEl = (group) => {
+      const slots = mapGroupToSlots(group, pages);
+      const wrap = document.createElement('div');
+      wrap.className = 'ml-duo-strip-spread';
+      wrap.dataset.chapterKey = route.key;
+      wrap.dataset.firstPage = String(group.pages[0] + 1);
+
+      if (slots.solo) {
+        wrap.appendChild(createPageImg(slots.solo));
+      } else {
+        const pair = document.createElement('div');
+        pair.className = 'ml-duo-strip-pair';
+        if (slots.left) pair.appendChild(createPageImg(slots.left));
+        if (slots.right) pair.appendChild(createPageImg(slots.right));
+        wrap.appendChild(pair);
+      }
+      return wrap;
+    };
+
+    const makeDivider = () => {
+      const div = document.createElement('div');
+      div.className = 'ml-duo-strip-divider';
+      div.innerHTML = `
+        <div class="ml-duo-strip-div-title">Том ${route.volume} · Глава ${route.number}</div>
+        <button type="button" class="ml-duo-strip-div-btn">Комментарии</button>
+      `;
+      div.querySelector('button').addEventListener('click', (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        openCommentsView(route);
+      });
+      return div;
+    };
+
+    if (settings.rtlNav) {
+      // В RTL сначала идут более дальние страницы (слева), затем первые (справа), а разделитель ставится перед новой главой (справа от неё)
+      for (const g of orderedGroups) fragment.appendChild(makeSpreadEl(g));
+      if (includeStartDivider) fragment.appendChild(makeDivider());
+    } else {
+      if (includeStartDivider) fragment.appendChild(makeDivider());
+      for (const g of orderedGroups) fragment.appendChild(makeSpreadEl(g));
+    }
+
+    return fragment;
+  }
+
+  function renderHorizontalStrip() {
+    const stage = document.getElementById('ml-duo-stage');
+    if (!stage || !chapterPages.length || settings.readingMode !== 'strip') return;
+
+    const route = parseChapterRoute() || { slug: '', volume: '1', number: '1', key: chapterKey || 'ch', langPrefix: '', hasRead: true };
+    resetStripState();
+    stripState.loadedKeys.add(route.key);
+    stripState.lastLoadedRoute = route;
+    stripState.chaptersData.set(route.key, { route, pages: chapterPages });
+
+    stage.innerHTML = '';
+    const track = document.createElement('div');
+    track.className = 'ml-duo-strip-track';
+    track.appendChild(buildStripChapterNodes(route, chapterPages, false));
+    stage.appendChild(track);
+
+    // Позиционируем полосу на текущий разворот
+    const alignInitialScroll = () => {
+      if (stripState.userScrolled) return;
+      const spreads = Array.from(track.querySelectorAll('.ml-duo-strip-spread'));
+      if (!spreads.length) return;
+      const targetIdx = settings.rtlNav
+        ? Math.max(0, spreads.length - 1 - currentSpreadIndex)
+        : Math.min(spreads.length - 1, currentSpreadIndex);
+      const targetEl = spreads[targetIdx];
+      if (targetEl) {
+        const left = targetEl.offsetLeft - Math.max(0, (stage.clientWidth - targetEl.offsetWidth) / 2);
+        stage.scrollLeft = Math.max(0, left);
+      } else if (settings.rtlNav) {
+        stage.scrollLeft = stage.scrollWidth - stage.clientWidth;
+      }
+    };
+
+    requestAnimationFrame(() => {
+      alignInitialScroll();
+      // Повторяем выравнивание после прогрузки первых картинок, если пользователь ещё не скроллил
+      setTimeout(alignInitialScroll, 180);
+      setTimeout(alignInitialScroll, 500);
+    });
+
+    // Заранее подгружаем список глав для бесконечной ленты
+    if (route.slug) fetchMangaChaptersList(route.slug);
+  }
+
+  async function maybeLoadNextChapterInStrip() {
+    if (settings.readingMode !== 'strip' || stripState.loadingNext || stripState.noMoreChapters) return;
+    const stage = document.getElementById('ml-duo-stage');
+    const track = stage?.querySelector('.ml-duo-strip-track');
+    if (!stage || !track || !stripState.lastLoadedRoute?.slug) return;
+
+    const distToEnd = settings.rtlNav
+      ? stage.scrollLeft
+      : (stage.scrollWidth - stage.clientWidth - stage.scrollLeft);
+
+    if (distToEnd > window.innerWidth * 1.6) return;
+
+    stripState.loadingNext = true;
+    try {
+      const cur = stripState.lastLoadedRoute;
+      const chapters = await fetchMangaChaptersList(cur.slug);
+      if (!chapters || !chapters.length) {
+        stripState.noMoreChapters = true;
+        return;
+      }
+
+      const idx = chapters.findIndex(c => c.volume === cur.volume && c.number === cur.number);
+      const next = idx >= 0 && idx + 1 < chapters.length
+        ? chapters[idx + 1]
+        : chapters.find(c => compareChapterOrder(c, cur) > 0);
+
+      if (!next) {
+        stripState.noMoreChapters = true;
+        appendEndOfMangaCard(track, cur);
+        return;
+      }
+
+      const nextRoute = {
+        langPrefix: cur.langPrefix || '',
+        slug: cur.slug,
+        hasRead: cur.hasRead,
+        volume: next.volume,
+        number: next.number,
+        key: `${cur.slug}_${next.volume}_${next.number}`
+      };
+
+      if (stripState.loadedKeys.has(nextRoute.key)) {
+        stripState.noMoreChapters = true;
+        return;
+      }
+
+      const search = new URLSearchParams(location.search);
+      const branchId = search.get('bid') || search.get('branch_id') || '';
+      const pages = await fetchChapterPagesByRoute(nextRoute, branchId);
+      if (!pages || !pages.length) {
+        stripState.noMoreChapters = true;
+        return;
+      }
+
+      stripState.loadedKeys.add(nextRoute.key);
+      stripState.lastLoadedRoute = nextRoute;
+      stripState.chaptersData.set(nextRoute.key, { route: nextRoute, pages });
+
+      const frag = buildStripChapterNodes(nextRoute, pages, true);
+
+      if (settings.rtlNav) {
+        // В RTL добавляем новую главу СЛЕВА и компенсируем scrollLeft, чтобы экран не прыгал
+        const prevScrollWidth = stage.scrollWidth;
+        const prevScrollLeft = stage.scrollLeft;
+        track.insertBefore(frag, track.firstChild);
+        const added = stage.scrollWidth - prevScrollWidth;
+        stage.scrollLeft = prevScrollLeft + added;
+      } else {
+        track.appendChild(frag);
+      }
+    } finally {
+      stripState.loadingNext = false;
+    }
+  }
+
+  function appendEndOfMangaCard(track, lastRoute) {
+    if (track.querySelector('.ml-duo-strip-end')) return;
+    const card = document.createElement('div');
+    card.className = 'ml-duo-strip-divider ml-duo-strip-end';
+    card.innerHTML = `
+      <div class="ml-duo-strip-div-title">Конец доступных глав</div>
+      <button type="button" class="ml-duo-strip-div-btn">Комментарии к главе</button>
+    `;
+    card.querySelector('button').addEventListener('click', (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      openCommentsView(lastRoute);
+    });
+    if (settings.rtlNav) {
+      track.insertBefore(card, track.firstChild);
+    } else {
+      track.appendChild(card);
+    }
+  }
+
+  function onStripScroll() {
+    if (settings.readingMode !== 'strip') return;
+    stripState.userScrolled = true;
+    maybeLoadNextChapterInStrip();
+
+    clearTimeout(stripState.scrollTimer);
+    stripState.scrollTimer = setTimeout(() => {
+      const stage = document.getElementById('ml-duo-stage');
+      if (!stage) return;
+      const centerX = stage.scrollLeft + stage.clientWidth / 2;
+      const spreads = stage.querySelectorAll('.ml-duo-strip-spread');
+      let best = null;
+      let bestDist = Infinity;
+
+      for (const el of spreads) {
+        const mid = el.offsetLeft + el.offsetWidth / 2;
+        const d = Math.abs(mid - centerX);
+        if (d < bestDist) {
+          bestDist = d;
+          best = el;
+        }
+      }
+
+      if (best) {
+        const key = best.dataset.chapterKey;
+        const pageNum = Number(best.dataset.firstPage) || 1;
+        const ch = stripState.chaptersData.get(key);
+        if (ch?.route) {
+          activeChapterRoute = ch.route;
+          syncPageQueryParam(pageNum, ch.route);
+        } else {
+          syncPageQueryParam(pageNum);
+        }
+      }
+    }, 140);
+  }
+
+  function onStripWheel(e) {
+    if (settings.readingMode !== 'strip' || isAnyModalOpen()) return;
+    const stage = document.getElementById('ml-duo-stage');
+    if (!stage) return;
+
+    // Колёсико мыши (вертикальная прокрутка) превращаем в плавное движение полосы вбок
+    if (Math.abs(e.deltaY) > Math.abs(e.deltaX)) {
+      e.preventDefault();
+      stripState.userScrolled = true;
+      const step = e.deltaY * 1.25;
+      stage.scrollLeft += settings.rtlNav ? -step : step;
+    }
+  }
+
+  function onStripPointerDown(e) {
+    if (isAnyModalOpen()) return;
+    if (e.target.closest('button')) return;
+
+    // На планшете/таче отдаём прокрутку нативному скроллу браузера, но ловим короткий тап по центру для меню
+    if (e.pointerType !== 'mouse') {
+      stripState.panActive = true;
+      stripState.panPointerId = e.pointerId;
+      stripState.panStartX = e.clientX;
+      stripState.panStartY = e.clientY;
+      stripState.panMoved = false;
+      window.addEventListener('pointermove', onStripTouchCheckMove, { passive: true });
+      window.addEventListener('pointerup', onStripTouchCheckUp);
+      return;
+    }
+
+    if (e.button !== 0) return;
+    const stage = document.getElementById('ml-duo-stage');
+    if (!stage) return;
+
+    stripState.panActive = true;
+    stripState.panPointerId = e.pointerId;
+    stripState.panStartX = e.clientX;
+    stripState.panStartY = e.clientY;
+    stripState.panStartScroll = stage.scrollLeft;
+    stripState.panMoved = false;
+
+    window.addEventListener('pointermove', onStripMouseMove);
+    window.addEventListener('pointerup', onStripMouseUp);
+    window.addEventListener('pointercancel', onStripMouseUp);
+  }
+
+  function onStripTouchCheckMove(e) {
+    if (!stripState.panActive || e.pointerId !== stripState.panPointerId) return;
+    if (Math.hypot(e.clientX - stripState.panStartX, e.clientY - stripState.panStartY) > 10) {
+      stripState.panMoved = true;
+    }
+  }
+
+  function onStripTouchCheckUp(e) {
+    if (!stripState.panActive || e.pointerId !== stripState.panPointerId) return;
+    window.removeEventListener('pointermove', onStripTouchCheckMove);
+    window.removeEventListener('pointerup', onStripTouchCheckUp);
+    stripState.panActive = false;
+
+    if (!stripState.panMoved) {
+      const ratio = stripState.panStartX / (window.innerWidth || 1);
+      if (ratio >= 0.25 && ratio <= 0.75) {
+        toggleReaderChrome();
+      }
+    }
+  }
+
+  function onStripMouseMove(e) {
+    if (!stripState.panActive || e.pointerId !== stripState.panPointerId) return;
+    const stage = document.getElementById('ml-duo-stage');
+    if (!stage) return;
+
+    const dx = e.clientX - stripState.panStartX;
+    if (!stripState.panMoved && Math.abs(dx) > 6) {
+      stripState.panMoved = true;
+      stripState.userScrolled = true;
+      stage.classList.add('is-dragging');
+    }
+
+    if (stripState.panMoved) {
+      stage.scrollLeft = stripState.panStartScroll - dx;
+    }
+  }
+
+  function onStripMouseUp(e) {
+    if (!stripState.panActive || e.pointerId !== stripState.panPointerId) return;
+    window.removeEventListener('pointermove', onStripMouseMove);
+    window.removeEventListener('pointerup', onStripMouseUp);
+    window.removeEventListener('pointercancel', onStripMouseUp);
+    stripState.panActive = false;
+
+    const stage = document.getElementById('ml-duo-stage');
+    if (stage) stage.classList.remove('is-dragging');
+
+    if (!stripState.panMoved) {
+      const vw = window.innerWidth || 1;
+      const ratio = stripState.panStartX / vw;
+      if (ratio >= 0.3 && ratio <= 0.7) {
+        toggleReaderChrome();
+      } else if (stage) {
+        const dir = ratio < 0.3 ? -1 : 1;
+        stage.scrollBy({ left: dir * Math.round(vw * 0.85), behavior: 'smooth' });
+      }
+    }
+  }
+
+  // =========================================================================
+  // 7. ОБЩАЯ СЦЕНА, ПЕРЕХОД ПО ГЛАВАМ И ДИСПЕТЧЕР
+  // =========================================================================
 
   function ensureStage() {
     let stage = document.getElementById('ml-duo-stage');
-    if (stage) return stage;
+    if (stage) {
+      stage.classList.toggle('mode-paged', settings.readingMode === 'paged');
+      stage.classList.toggle('mode-strip', settings.readingMode === 'strip');
+      return stage;
+    }
 
     stage = document.createElement('div');
     stage.id = 'ml-duo-stage';
+    stage.className = settings.readingMode === 'strip' ? 'mode-strip' : 'mode-paged';
 
-    // Подстраиваем фон сцены под текущую тему MangaLib
     const bodyBg = getComputedStyle(document.body).backgroundColor;
     if (bodyBg && bodyBg !== 'rgba(0, 0, 0, 0)' && bodyBg !== 'transparent') {
       stage.style.setProperty('--ml-duo-bg', bodyBg);
     }
 
-    stage.innerHTML = `
-      <div class="ml-duo-viewport">
-        <div class="ml-duo-spread"></div>
-      </div>
-    `;
+    stage.addEventListener('pointerdown', (e) => {
+      if (settings.readingMode === 'strip') {
+        onStripPointerDown(e);
+      } else {
+        onPagedPointerDown(e);
+      }
+    });
 
-    stage.addEventListener('pointerdown', onStagePointerDown);
-    // Глушим обычные click, чтобы читалка MangaLib под сценой не перелистывала главы сама
+    stage.addEventListener('wheel', onStripWheel, { passive: false });
+    stage.addEventListener('scroll', onStripScroll, { passive: true });
+
+    stage.addEventListener('touchmove', (e) => {
+      if (settings.readingMode === 'paged' && curl.active) {
+        e.preventDefault();
+      }
+    }, { passive: false });
+
     stage.addEventListener('click', (e) => {
+      if (e.target.closest('button')) return;
       e.preventDefault();
       e.stopPropagation();
     });
 
     document.body.appendChild(stage);
     return stage;
-  }
-
-  // =========================================================================
-  // 6. ПЕРЕХОД НА СОСЕДНЮЮ ГЛАВУ И ДИСПЕТЧЕР ОТРИСОВКИ
-  // =========================================================================
-
-  function compareChapterOrder(a, b) {
-    const va = parseFloat(a.volume) || 0;
-    const vb = parseFloat(b.volume) || 0;
-    if (va !== vb) return va - vb;
-    return (parseFloat(a.number) || 0) - (parseFloat(b.number) || 0);
   }
 
   function goToAdjacentChapter(direction) {
@@ -1483,17 +2238,21 @@
 
   function restoreNativeContainer() {
     if (hiddenNativeContainer) {
-      hiddenNativeContainer.classList.remove('ml-duo-native-masked');
+      hiddenNativeContainer.classList.remove('ml-duo-native-masked', 'ml-duo-native-collapsed');
       hiddenNativeContainer = null;
     }
   }
 
   function cleanupDuoStage() {
-    clearTimeout(animTimer);
-    cleanupDragListeners();
-    drag.active = false;
-    drag.isDragging = false;
-    isAnimatingFinish = false;
+    stopCurlAnimation();
+    cleanupPagedDragListeners();
+    curl.active = false;
+    curl.isDragging = false;
+    commentsOpen = false;
+    resetStripState();
+
+    const backBtn = document.getElementById('ml-duo-back-to-manga');
+    if (backBtn) backBtn.remove();
 
     const stage = document.getElementById('ml-duo-stage');
     if (stage) stage.remove();
@@ -1503,7 +2262,7 @@
   }
 
   function getLayoutSig() {
-    return `${chapterKey}|${chapterPages.length}|${cdnOrigin}|${settings.firstPageSide}|${settings.rtlNav}|${settings.flipAnimation}|${settings.coverAlone}|${settings.autoWide}`;
+    return `${chapterKey}|${chapterPages.length}|${cdnOrigin}|${settings.readingMode}|${settings.firstPageSide}|${settings.rtlNav}|${settings.pageCurl}|${settings.coverAlone}|${settings.autoWide}`;
   }
 
   function applyDuoLayout() {
@@ -1512,17 +2271,19 @@
       return;
     }
 
+    if (commentsOpen) return;
+
     const nativeImgs = getNativeReaderImages();
     detectCdnFromBrowser();
     collectDomPagesFallback(nativeImgs);
 
     if (!pagesFromApi) {
-      loadChapterFromApi();
+      loadCurrentChapterFromApi();
     }
 
-    // Не перекрываем сайт, пока не получены страницы и реальный хост картинок (чтобы не было пустого экрана или [?])
     if (!chapterPages.length) return;
     if (!cdnOrigin && !chapterPages[0].fullUrl && !isRealFullUrl(chapterPages[0].url)) {
+      loadImageServersOnce();
       return;
     }
 
@@ -1540,10 +2301,22 @@
 
     const stage = ensureStage();
     const sig = getLayoutSig();
-    if (!drag.isDragging && !isAnimatingFinish && (stage.dataset.sig !== sig || !stage.querySelector('.ml-duo-spread')?.children.length)) {
+    if (!curl.isDragging && !curl.isAnimating && (stage.dataset.sig !== sig || !stage.children.length)) {
       stage.dataset.sig = sig;
-      renderStaticCurrentSpread();
+      if (settings.readingMode === 'strip') {
+        renderHorizontalStrip();
+      } else {
+        renderStaticCurrentSpread();
+      }
     }
+
+    // Если был отложенный переход к комментариям другой главы — открываем сразу
+    try {
+      if (sessionStorage.getItem(COMMENTS_FLAG_KEY) === '1') {
+        sessionStorage.removeItem(COMMENTS_FLAG_KEY);
+        setTimeout(() => openCommentsView(), 200);
+      }
+    } catch (_) {}
   }
 
   function scheduleRender() {
@@ -1555,7 +2328,7 @@
   }
 
   // =========================================================================
-  // 7. НАТИВНАЯ СЕКЦИЯ НАСТРОЕК ВНУТРИ МЕНЮ MANGALIB
+  // 8. НАТИВНАЯ СЕКЦИЯ НАСТРОЕК ВНУТРИ МЕНЮ MANGALIB
   // =========================================================================
 
   function createSettingsSection(suffix = '') {
@@ -1576,6 +2349,14 @@
 
       <div class="ml-duo-sub">
         <div class="ml-duo-col">
+          <span class="ml-duo-label">Режим листания</span>
+          <div class="ml-duo-seg">
+            <button type="button" class="ml-duo-seg-btn" data-mode="paged">Постранично</button>
+            <button type="button" class="ml-duo-seg-btn" data-mode="strip">Полоса вбок</button>
+          </div>
+        </div>
+
+        <div class="ml-duo-col">
           <span class="ml-duo-label">Первая страница</span>
           <div class="ml-duo-seg">
             <button type="button" class="ml-duo-seg-btn" data-side="right">Справа (манга)</button>
@@ -1591,10 +2372,10 @@
           </label>
         </div>
 
-        <div class="ml-duo-row">
-          <span class="ml-duo-label">Перелистывание книги (3D)</span>
+        <div class="ml-duo-row ml-duo-paged-only">
+          <span class="ml-duo-label">Анимация страницы (книга)</span>
           <label class="ml-duo-switch">
-            <input type="checkbox" data-setting="flipAnimation">
+            <input type="checkbox" data-setting="pageCurl">
             <span class="ml-duo-slider"></span>
           </label>
         </div>
@@ -1630,6 +2411,10 @@
             <span class="ml-duo-slider"></span>
           </label>
         </div>
+
+        <button type="button" class="ml-duo-action-btn" data-action="comments">
+          Комментарии к главе (C)
+        </button>
       </div>
     `;
 
@@ -1641,6 +2426,27 @@
 
     const fsInput = sec.querySelector('input[data-action="fullscreen"]');
     if (fsInput) fsInput.addEventListener('change', toggleFullscreen);
+
+    const commentsBtn = sec.querySelector('button[data-action="comments"]');
+    if (commentsBtn) {
+      commentsBtn.addEventListener('click', (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        if (commentsOpen) {
+          closeCommentsView();
+        } else {
+          openCommentsView();
+        }
+      });
+    }
+
+    sec.querySelectorAll('button[data-mode]').forEach(btn => {
+      btn.addEventListener('click', (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        saveSettings({ readingMode: btn.dataset.mode });
+      });
+    });
 
     sec.querySelectorAll('button[data-side]').forEach(btn => {
       btn.addEventListener('click', (e) => {
@@ -1663,9 +2469,16 @@
     const fsInput = sec.querySelector('input[data-action="fullscreen"]');
     if (fsInput) fsInput.checked = isFullscreen();
 
+    sec.querySelectorAll('button[data-mode]').forEach(btn => {
+      btn.classList.toggle('is-active', btn.dataset.mode === settings.readingMode);
+    });
+
     sec.querySelectorAll('button[data-side]').forEach(btn => {
       btn.classList.toggle('is-active', btn.dataset.side === settings.firstPageSide);
     });
+
+    const pagedOnly = sec.querySelector('.ml-duo-paged-only');
+    if (pagedOnly) pagedOnly.style.display = settings.readingMode === 'paged' ? '' : 'none';
 
     const sub = sec.querySelector('.ml-duo-sub');
     if (sub) sub.classList.toggle('ml-duo-disabled', !settings.enabled);
@@ -1753,7 +2566,7 @@
   }
 
   // =========================================================================
-  // 8. КЛАВИАТУРА, ОТСЛЕЖИВАНИЕ ПЕРЕХОДОВ SPA И ЗАПУСК
+  // 9. КЛАВИАТУРА, ПЕРЕХВАТ РОДНОЙ КНОПКИ КОММЕНТАРИЕВ И ЗАПУСК
   // =========================================================================
 
   function isAnyModalOpen() {
@@ -1772,18 +2585,30 @@
       chapterPages = [];
       pagesFromApi = false;
       chapterKey = '';
+      initialDomRouteKey = '';
+      activeChapterRoute = null;
       apiFetchInFlightFor = '';
       cleanupDuoStage();
       return;
     }
 
+    // В режиме бесконечной полосы мы сами обновляем URL при прокрутке — не сбрасываем сцену, если глава уже в полосе
+    if (settings.readingMode === 'strip' && stripState.loadedKeys.has(nextRoute.key)) {
+      return;
+    }
+
     if (!prevRoute || prevRoute.key !== nextRoute.key) {
+      stopCurlAnimation();
+      if (commentsOpen) closeCommentsView();
       chapterPages = [];
       pagesFromApi = false;
       chapterKey = '';
+      initialDomRouteKey = nextRoute.key;
+      activeChapterRoute = nextRoute;
       apiFetchInFlightFor = '';
       currentSpreadIndex = 0;
       uiHidden = settings.cleanScreen;
+      resetStripState();
 
       const stage = document.getElementById('ml-duo-stage');
       if (stage) stage.remove();
@@ -1793,11 +2618,34 @@
   }
 
   function setupListeners() {
+    // Если нажали на родную кнопку «Комментарии» в верхней/нижней панели MangaLib — открываем комментарии
+    document.addEventListener('click', (e) => {
+      if (!isReaderPage() || !settings.enabled || commentsOpen) return;
+      const btn = e.target?.closest?.('a, button');
+      if (!btn || btn.closest('#ml-duo-stage, #ml-duo-settings-section, #ml-duo-fallback-backdrop')) return;
+
+      const metaText = `${btn.getAttribute('href') || ''} ${btn.getAttribute('title') || ''} ${btn.getAttribute('aria-label') || ''} ${btn.textContent || ''}`;
+      if (/#comments|коммент|comment/i.test(metaText)) {
+        setTimeout(() => {
+          if (!isAnyModalOpen() && !commentsOpen) {
+            openCommentsView();
+          }
+        }, 180);
+      }
+    }, true);
+
     window.addEventListener('keydown', (e) => {
       if (!isReaderPage()) return;
 
       const tag = (e.target?.tagName || '').toUpperCase();
       if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || e.target?.isContentEditable) return;
+
+      // Esc закрывает режим комментариев
+      if (e.code === 'Escape' && commentsOpen) {
+        e.preventDefault();
+        closeCommentsView();
+        return;
+      }
 
       if (e.altKey && !e.ctrlKey && !e.metaKey && e.code === 'KeyD') {
         e.preventDefault();
@@ -1815,6 +2663,16 @@
 
       if (e.ctrlKey || e.altKey || e.metaKey) return;
 
+      // C — открыть/закрыть комментарии к главе
+      if (e.code === 'KeyC' && settings.enabled && !isAnyModalOpen()) {
+        e.preventDefault();
+        e.stopImmediatePropagation();
+        if (commentsOpen) closeCommentsView();
+        else openCommentsView();
+        return;
+      }
+
+      // F — на весь экран
       if (e.code === 'KeyF' && !isAnyModalOpen()) {
         e.preventDefault();
         e.stopImmediatePropagation();
@@ -1822,31 +2680,72 @@
         return;
       }
 
-      if (!settings.enabled || !document.getElementById('ml-duo-stage') || isAnyModalOpen()) return;
+      if (!settings.enabled || commentsOpen || isAnyModalOpen()) return;
+      const stage = document.getElementById('ml-duo-stage');
+      if (!stage) return;
 
+      // В режиме горизонтальной полосы клавиши плавно двигают ленту вбок
+      if (settings.readingMode === 'strip') {
+        const jump = Math.round(window.innerWidth * 0.85);
+        if (e.code === 'ArrowLeft' || e.code === 'KeyA') {
+          e.preventDefault();
+          e.stopImmediatePropagation();
+          stripState.userScrolled = true;
+          stage.scrollBy({ left: -jump, behavior: 'smooth' });
+        } else if (e.code === 'ArrowRight' || e.code === 'KeyD') {
+          e.preventDefault();
+          e.stopImmediatePropagation();
+          stripState.userScrolled = true;
+          stage.scrollBy({ left: jump, behavior: 'smooth' });
+        } else if (e.code === 'Space') {
+          e.preventDefault();
+          e.stopImmediatePropagation();
+          stripState.userScrolled = true;
+          const dir = (e.shiftKey ? -1 : 1) * (settings.rtlNav ? -1 : 1);
+          stage.scrollBy({ left: dir * jump, behavior: 'smooth' });
+        }
+        return;
+      }
+
+      // В постраничном режиме
       if (e.code === 'ArrowLeft' || e.code === 'KeyA') {
         e.preventDefault();
         e.stopPropagation();
         e.stopImmediatePropagation();
-        animateTurnToSpread(settings.rtlNav ? 1 : -1);
+        triggerPagedTurn(settings.rtlNav ? 1 : -1);
       } else if (e.code === 'ArrowRight' || e.code === 'KeyD') {
         e.preventDefault();
         e.stopPropagation();
         e.stopImmediatePropagation();
-        animateTurnToSpread(settings.rtlNav ? -1 : 1);
+        triggerPagedTurn(settings.rtlNav ? -1 : 1);
       } else if (e.code === 'Space') {
         e.preventDefault();
         e.stopPropagation();
         e.stopImmediatePropagation();
-        animateTurnToSpread(e.shiftKey ? -1 : 1);
+        triggerPagedTurn(e.shiftKey ? -1 : 1);
       }
     }, true);
 
-    document.addEventListener('fullscreenchange', syncAllSettingsUI);
-    document.addEventListener('webkitfullscreenchange', syncAllSettingsUI);
-    window.addEventListener('popstate', checkRouteChange);
+    window.addEventListener('resize', () => {
+      if (isReaderPage() && settings.enabled && !commentsOpen && settings.readingMode === 'paged' && !curl.isDragging && !curl.isAnimating) {
+        renderStaticCurrentSpread();
+      }
+    });
 
-    // Лёгкая проверка SPA-маршрута без модификации history.pushState
+    document.addEventListener('fullscreenchange', () => {
+      syncAllSettingsUI();
+      if (isReaderPage() && settings.enabled && !commentsOpen && settings.readingMode === 'paged') {
+        setTimeout(renderStaticCurrentSpread, 60);
+      }
+    });
+    document.addEventListener('webkitfullscreenchange', () => {
+      syncAllSettingsUI();
+      if (isReaderPage() && settings.enabled && !commentsOpen && settings.readingMode === 'paged') {
+        setTimeout(renderStaticCurrentSpread, 60);
+      }
+    });
+
+    window.addEventListener('popstate', checkRouteChange);
     setInterval(checkRouteChange, 250);
 
     const observer = new MutationObserver((mutations) => {
@@ -1854,7 +2753,7 @@
       let needSettings = false;
 
       for (const m of mutations) {
-        if (m.target?.closest?.('#ml-duo-stage, #ml-duo-settings-section, #ml-duo-fallback-backdrop')) {
+        if (m.target?.closest?.('#ml-duo-stage, #ml-duo-settings-section, #ml-duo-fallback-backdrop, #ml-duo-back-to-manga')) {
           continue;
         }
         if (m.type === 'childList' && (m.addedNodes.length || m.removedNodes.length)) {
@@ -1880,9 +2779,19 @@
   function init() {
     injectStyles();
 
+    const startRoute = parseChapterRoute();
+    if (startRoute) {
+      initialDomRouteKey = startRoute.key;
+      activeChapterRoute = startRoute;
+    }
+
     try {
       if (typeof GM_registerMenuCommand === 'function') {
         GM_registerMenuCommand('Настройки mangalib-duo', openFallbackModal);
+        GM_registerMenuCommand('Комментарии к главе (C)', () => {
+          if (commentsOpen) closeCommentsView();
+          else openCommentsView();
+        });
         GM_registerMenuCommand('Вкл/Выкл разворот (Alt+D)', () => saveSettings({ enabled: !settings.enabled }));
       }
     } catch (_) {}
